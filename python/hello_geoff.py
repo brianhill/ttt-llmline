@@ -17,6 +17,7 @@ suffix = ".fits"
 # Alignment precision (fixed value)
 target_alignment_accuracy = 0.1  # pixels
 num_stars_for_alignment = 20
+num_images_for_template = 7  # Number of first images to use for median template
 
 
 def load_matching_fits_images(dir_path, file_prefix, file_suffix):
@@ -151,13 +152,13 @@ def extract_local_patch(image, center_y, center_x, radius=5):
     return patch
 
 
-def align_images(reference, target, ref_star_data, num_stars=20):
+def align_images(template, target, template_star_data, num_stars=20):
     targ_star_data = find_star_centroids_and_fwhms(target, num_stars)
 
-    if len(ref_star_data) < 5 or len(targ_star_data) < 5:
+    if len(template_star_data) < 5 or len(targ_star_data) < 5:
         raise ValueError("Insufficient stars for alignment.")
 
-    ref_pos = np.array([[x, y] for x, y, _, _ in ref_star_data])
+    template_pos = np.array([[x, y] for x, y, _, _ in template_star_data])
     targ_pos = np.array([[x, y] for x, y, _, _ in targ_star_data])
 
     tree = KDTree(targ_pos)
@@ -165,15 +166,15 @@ def align_images(reference, target, ref_star_data, num_stars=20):
 
     matched_data = []
     deltas = []
-    for i, pos_ref in enumerate(ref_pos):
-        dist, idx = tree.query(pos_ref)
+    for i, pos_template in enumerate(template_pos):
+        dist, idx = tree.query(pos_template)
         if dist < max_dist:
             pos_targ = targ_pos[idx]
-            delta = pos_targ - pos_ref
+            delta = pos_targ - pos_template
             deltas.append(delta)
             matched_data.append({
-                'ref_x': pos_ref[0],
-                'ref_y': pos_ref[1],
+                'template_x': pos_template[0],
+                'template_y': pos_template[1],
                 'targ_x': pos_targ[0],
                 'targ_y': pos_targ[1]
             })
@@ -189,7 +190,7 @@ def align_images(reference, target, ref_star_data, num_stars=20):
     # KEY STEP: Sub-pixel image displacement via interpolation
     #
     # The following line performs the actual alignment of the target image to the
-    # reference by shifting it by the computed (sub-pixel) offsets.
+    # template by shifting it by the computed (sub-pixel) offsets.
     #
     # - shift() from scipy.ndimage uses spline interpolation.
     # - order=5 specifies 5th-order (quintic) spline interpolation for high accuracy.
@@ -220,41 +221,69 @@ if __name__ == "__main__":
             image_directory_path, prefix, suffix
         )
 
-        # NEW: Print total number of images loaded
         print(f"\nTotal number of images in the sequence: {len(images_data)}")
 
-        # Use first and last images
-        ref_img = images_data[0]  # First image in sequence
-        targ_img = images_data[-1]  # Last image in sequence
-        file1 = image_files[0]
+        # Use last image as target
+        targ_img = images_data[-1]
         file2 = image_files[-1]
 
-        print(f"\nUsing images:")
-        print(f"  Reference (first in sequence): {os.path.basename(file1)}")
-        print(f"  Target (last in sequence): {os.path.basename(file2)}")
+        print(f"\nTarget (last in sequence): {os.path.basename(file2)}")
 
-        print("\nFinding stars in reference image...")
-        ref_star_data = find_star_centroids_and_fwhms(ref_img, num_stars_for_alignment)
-        fwhm_pixels = estimate_fwhm(ref_star_data)
-        print(f"Estimated median FWHM: {fwhm_pixels:.2f} pixels")
+        ############################################################################
+        # TEMPLATE GENERATION BLOCK
+        #
+        # This block creates a high-quality median template from the first
+        # num_images_for_template images in the sequence.
+        #
+        # 1. The very first image is used as the alignment base.
+        # 2. Star centroids are measured on this base image.
+        # 3. Each subsequent image (2nd through 7th) is aligned to the base using
+        #    the same centroid-matching and sub-pixel shift method as the main
+        #    alignment.
+        # 4. A pixel-by-pixel median is computed across the 7 aligned images.
+        #
+        # Benefits:
+        #   - Cosmic rays and transient artifacts are rejected by the median.
+        #   - Signal-to-noise is improved.
+        #   - The template remains photometrically consistent with the individual
+        #     frames.
+        #
+        # The resulting template_img is used for all further analysis and subtraction.
+        ############################################################################
+        print(f"\nCreating median template from the first {num_images_for_template} images...")
+        first_images = images_data[:num_images_for_template]
+        template_base = first_images[0]
+        template_star_data = find_star_centroids_and_fwhms(template_base, num_stars_for_alignment)
+
+        aligned_first_images = [template_base]  # First image is already aligned to itself
+        for img in first_images[1:]:
+            aligned_img, _ = align_images(template_base, img, template_star_data, num_stars_for_alignment)
+            aligned_first_images.append(aligned_img)
+
+        template_img = np.median(aligned_first_images, axis=0)
+        print("Median template created.")
+
+        fwhm_pixels = estimate_fwhm(template_star_data)
+        print(f"Estimated median FWHM (from first image): {fwhm_pixels:.2f} pixels")
 
         print("\nSelecting a different bright star (within 2000 px of center) for zoom...")
-        center_y, center_x, reference_star_peak = find_suitable_bright_star(ref_star_data, ref_img.shape)
+        center_y, center_x, template_star_peak = find_suitable_bright_star(template_star_data, template_img.shape)
         print(f"Selected star at (x, y) = ({center_x:.2f}, {center_y:.2f})")
-        print(f"Maximum value at the peak pixel of this reference star: {reference_star_peak:.1f} counts")
+        print(f"Maximum value at the peak pixel of this template star: {template_star_peak:.1f} counts")
         zoom_half_size = int(5 * fwhm_pixels)
 
         # Compute differences
-        unaligned_diff = ref_img - targ_img
+        unaligned_diff = template_img - targ_img
 
-        print("\nAligning target image to reference using star centroids...")
-        aligned_target, matched_centroids = align_images(ref_img, targ_img, ref_star_data, num_stars_for_alignment)
+        print("\nAligning target image to template using star centroids...")
+        aligned_target, matched_centroids = align_images(template_img, targ_img, template_star_data,
+                                                         num_stars_for_alignment)
 
-        aligned_diff = ref_img - aligned_target
+        aligned_diff = template_img - aligned_target
 
-        # Local max in reference star (original image)
-        local_ref_patch = extract_local_patch(ref_img, center_y, center_x, radius=5)
-        local_ref_max = np.max(local_ref_patch)
+        # Local max in template star (original image)
+        local_template_patch = extract_local_patch(template_img, center_y, center_x, radius=5)
+        local_template_max = np.max(local_template_patch)
 
         # Local min/max in aligned difference around the same star
         local_diff_patch = extract_local_patch(aligned_diff, center_y, center_x, radius=5)
@@ -262,28 +291,35 @@ if __name__ == "__main__":
         local_diff_max = np.max(local_diff_patch)
 
         # Save differences
-        unaligned_output_path = os.path.join(cwd, "unaligned_first_last_difference.fits")
-        aligned_output_path = os.path.join(cwd, "aligned_first_last_difference.fits")
+        unaligned_output_path = os.path.join(cwd, "unaligned_template_last_difference.fits")
+        aligned_output_path = os.path.join(cwd, "aligned_template_last_difference.fits")
         fits.PrimaryHDU(unaligned_diff).writeto(unaligned_output_path, overwrite=True)
         fits.PrimaryHDU(aligned_diff).writeto(aligned_output_path, overwrite=True)
+
+        # Also save the template image
+        template_output_path = os.path.join(cwd, "median_template.fits")
+        fits.PrimaryHDU(template_img).writeto(template_output_path, overwrite=True)
 
         print("\nUnaligned difference (global):")
         print(f"  Mean: {np.mean(unaligned_diff):.4f}   Std: {np.std(unaligned_diff):.4f}")
         print("\nAligned difference (final result):")
         print(f"  Global mean: {np.mean(aligned_diff):.4f}   Global std: {np.std(aligned_diff):.4f}")
-        print(f"  Local (within 5 px of reference star) minimum: {local_diff_min:.1f}")
-        print(f"  Local (within 5 px of reference star) maximum: {local_diff_max:.1f}")
+        print(f"  Local (within 5 px of template star) minimum: {local_diff_min:.1f}")
+        print(f"  Local (within 5 px of template star) maximum: {local_diff_max:.1f}")
         print(
-            f"\nNote: Local reference star max in original image: {local_ref_max:.1f} counts (should match peak above)")
-        print(f"\nDifference images saved to:\n  {unaligned_output_path}\n  {aligned_output_path}")
+            f"\nNote: Local template star max in original image: {local_template_max:.1f} counts (should match peak above)")
+        print(f"\nImages saved to:")
+        print(f"  Median template: {template_output_path}")
+        print(f"  Unaligned difference: {unaligned_output_path}")
+        print(f"  Aligned difference: {aligned_output_path}")
 
         # Centroid table
         print("\n" + "=" * 100)
         print("CENTROID TABLE FOR MATCHED STARS")
         print("=" * 100)
         df_centroids = pd.DataFrame(matched_centroids)
-        df_centroids = df_centroids[['ref_x', 'ref_y', 'targ_x', 'targ_y', 'aligned_x', 'aligned_y']]
-        df_centroids.columns = ['Ref X', 'Ref Y', 'Targ X', 'Targ Y', 'Aligned Targ X', 'Aligned Targ Y']
+        df_centroids = df_centroids[['template_x', 'template_y', 'targ_x', 'targ_y', 'aligned_x', 'aligned_y']]
+        df_centroids.columns = ['Template X', 'Template Y', 'Targ X', 'Targ Y', 'Aligned Targ X', 'Aligned Targ Y']
         df_centroids = df_centroids.round(3)
         print(df_centroids.to_string(index=False))
         print("=" * 100)
@@ -293,7 +329,7 @@ if __name__ == "__main__":
 
         im0 = axs[0].imshow(unaligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(unaligned_diff) * 3, vmax=np.std(unaligned_diff) * 3)
-        axs[0].set_title(f'Unaligned Difference (first − last)\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
+        axs[0].set_title(f'Unaligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
                          f'FWHM ≈ {fwhm_pixels:.2f} px | Zoom on star at ({center_x:.1f}, {center_y:.1f})')
         axs[0].set_xlabel('X pixel')
         axs[0].set_ylabel('Y pixel')
@@ -303,7 +339,7 @@ if __name__ == "__main__":
 
         im1 = axs[1].imshow(aligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(aligned_diff) * 3, vmax=np.std(aligned_diff) * 3)
-        axs[1].set_title(f'Aligned Difference (first − last)\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
+        axs[1].set_title(f'Aligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
                          f'Alignment target: ±{target_alignment_accuracy:.2f} px')
         axs[1].set_xlabel('X pixel')
         axs[1].set_xlim(center_x - zoom_half_size, center_x + zoom_half_size)
