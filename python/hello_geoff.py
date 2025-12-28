@@ -112,7 +112,6 @@ def estimate_fwhm(star_data):
     return np.median(fwhms)
 
 
-# MODIFIED: Increased radius to 2000 pixels
 def find_suitable_bright_star(star_data, image_shape, max_dist_from_center=2000.0):
     ny, nx = image_shape
     cy, cx = ny / 2.0, nx / 2.0
@@ -126,13 +125,11 @@ def find_suitable_bright_star(star_data, image_shape, max_dist_from_center=2000.
     if len(candidates) < 2:
         raise ValueError("Fewer than 2 stars found within 2000 px of the image center.")
 
-    # Sort by distance first (closest), then by brightness (descending)
     candidates.sort(key=lambda t: (t[0], -t[1]))
 
-    # Select the SECOND candidate to get a different star
+    # Select the SECOND candidate
     _, _, best_x, best_y = candidates[1]
 
-    # Retrieve the corresponding peak value
     for entry in star_data:
         if abs(entry[0] - best_x) < 0.1 and abs(entry[1] - best_y) < 0.1:
             selected_peak = entry[3]
@@ -208,14 +205,18 @@ if __name__ == "__main__":
             image_directory_path, prefix, suffix
         )
 
-        ref_img = images_data[0]
-        targ_img = images_data[1]
+        # NEW: Print total number of images loaded
+        print(f"\nTotal number of images in the sequence: {len(images_data)}")
+
+        # Use first and last images
+        ref_img = images_data[0]  # First image in sequence
+        targ_img = images_data[-1]  # Last image in sequence
         file1 = image_files[0]
-        file2 = image_files[1]
+        file2 = image_files[-1]
 
         print(f"\nUsing images:")
-        print(f"  Reference (fixed): {os.path.basename(file1)}")
-        print(f"  Target: {os.path.basename(file2)}")
+        print(f"  Reference (first in sequence): {os.path.basename(file1)}")
+        print(f"  Target (last in sequence): {os.path.basename(file2)}")
 
         print("\nFinding stars in reference image...")
         ref_star_data = find_star_centroids_and_fwhms(ref_img, num_stars_for_alignment)
@@ -246,8 +247,8 @@ if __name__ == "__main__":
         local_diff_max = np.max(local_diff_patch)
 
         # Save differences
-        unaligned_output_path = os.path.join(cwd, "unaligned_difference.fits")
-        aligned_output_path = os.path.join(cwd, "aligned_difference.fits")
+        unaligned_output_path = os.path.join(cwd, "unaligned_first_last_difference.fits")
+        aligned_output_path = os.path.join(cwd, "aligned_first_last_difference.fits")
         fits.PrimaryHDU(unaligned_diff).writeto(unaligned_output_path, overwrite=True)
         fits.PrimaryHDU(aligned_diff).writeto(aligned_output_path, overwrite=True)
 
@@ -277,7 +278,7 @@ if __name__ == "__main__":
 
         im0 = axs[0].imshow(unaligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(unaligned_diff) * 3, vmax=np.std(unaligned_diff) * 3)
-        axs[0].set_title(f'Unaligned Difference\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
+        axs[0].set_title(f'Unaligned Difference (first − last)\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
                          f'FWHM ≈ {fwhm_pixels:.2f} px | Zoom on star at ({center_x:.1f}, {center_y:.1f})')
         axs[0].set_xlabel('X pixel')
         axs[0].set_ylabel('Y pixel')
@@ -287,7 +288,7 @@ if __name__ == "__main__":
 
         im1 = axs[1].imshow(aligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(aligned_diff) * 3, vmax=np.std(aligned_diff) * 3)
-        axs[1].set_title(f'Aligned Difference\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
+        axs[1].set_title(f'Aligned Difference (first − last)\n{os.path.basename(file1)} − {os.path.basename(file2)}\n'
                          f'Alignment target: ±{target_alignment_accuracy:.2f} px')
         axs[1].set_xlabel('X pixel')
         axs[1].set_xlim(center_x - zoom_half_size, center_x + zoom_half_size)
