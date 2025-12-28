@@ -20,10 +20,6 @@ num_stars_for_alignment = 20
 
 
 def load_matching_fits_images(dir_path, file_prefix, file_suffix):
-    """
-    Finds and loads FITS images matching the prefix and suffix.
-    Returns list of image data (as float32) and list of filenames.
-    """
     pattern = os.path.join(dir_path, file_prefix + "*" + file_suffix)
     matching_files = sorted(glob.glob(pattern))
 
@@ -48,10 +44,6 @@ def load_matching_fits_images(dir_path, file_prefix, file_suffix):
 
 
 def find_star_centroids_and_fwhms(image_data, num_stars=20):
-    """
-    Finds bright, isolated sources and fits 2D Gaussians to get sub-pixel centroids and FWHMs.
-    Returns list of (x, y, fwhm_mean) for successful fits.
-    """
     background = np.median(image_data)
     data_sub = image_data - background
 
@@ -65,7 +57,6 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
     box_half_size = 15
     fitter = fitting.LevMarLSQFitter()
 
-    # Sort peaks by brightness descending
     intensities = data_sub[peaks[0], peaks[1]]
     sorted_indices = np.argsort(-intensities)
     sorted_peaks_y = peaks[0][sorted_indices]
@@ -100,7 +91,8 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
                 fwhm_mean = np.mean([g_fit.x_stddev.value * 2.355, g_fit.y_stddev.value * 2.355])
                 full_x = x0 + g_fit.x_mean.value
                 full_y = y0 + g_fit.y_mean.value
-                star_data.append((full_x, full_y, fwhm_mean))
+                peak_pixel = image_data[int(np.round(full_y)), int(np.round(full_x))]
+                star_data.append((full_x, full_y, fwhm_mean, peak_pixel))
         except Exception:
             continue
 
@@ -120,25 +112,56 @@ def estimate_fwhm(star_data):
     return np.median(fwhms)
 
 
-def find_bright_star(star_data):
-    if len(star_data) == 0:
-        raise ValueError("No stars for zooming.")
-    x, y, _ = star_data[0]  # brightest
-    return y, x
+# MODIFIED: Increased radius to 2000 pixels
+def find_suitable_bright_star(star_data, image_shape, max_dist_from_center=2000.0):
+    ny, nx = image_shape
+    cy, cx = ny / 2.0, nx / 2.0
+
+    candidates = []
+    for x, y, _, peak in star_data:
+        dist_to_center = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        if dist_to_center <= max_dist_from_center:
+            candidates.append((dist_to_center, peak, x, y))
+
+    if len(candidates) < 2:
+        raise ValueError("Fewer than 2 stars found within 2000 px of the image center.")
+
+    # Sort by distance first (closest), then by brightness (descending)
+    candidates.sort(key=lambda t: (t[0], -t[1]))
+
+    # Select the SECOND candidate to get a different star
+    _, _, best_x, best_y = candidates[1]
+
+    # Retrieve the corresponding peak value
+    for entry in star_data:
+        if abs(entry[0] - best_x) < 0.1 and abs(entry[1] - best_y) < 0.1:
+            selected_peak = entry[3]
+            break
+    else:
+        selected_peak = 0.0
+
+    return best_y, best_x, selected_peak
+
+
+def extract_local_patch(image, center_y, center_x, radius=5):
+    y0 = int(np.floor(center_y - radius))
+    y1 = int(np.floor(center_y + radius + 1))
+    x0 = int(np.floor(center_x - radius))
+    x1 = int(np.floor(center_x + radius + 1))
+
+    ny, nx = image.shape
+    patch = image[max(0, y0):min(ny, y1), max(0, x0):min(nx, x1)]
+    return patch
 
 
 def align_images(reference, target, ref_star_data, num_stars=20):
-    """
-    Aligns target to reference using matched centroids.
-    Returns aligned target and list of matched centroid data for table.
-    """
     targ_star_data = find_star_centroids_and_fwhms(target, num_stars)
 
     if len(ref_star_data) < 5 or len(targ_star_data) < 5:
         raise ValueError("Insufficient stars for alignment.")
 
-    ref_pos = np.array([[x, y] for x, y, _ in ref_star_data])
-    targ_pos = np.array([[x, y] for x, y, _ in targ_star_data])
+    ref_pos = np.array([[x, y] for x, y, _, _ in ref_star_data])
+    targ_pos = np.array([[x, y] for x, y, _, _ in targ_star_data])
 
     tree = KDTree(targ_pos)
     max_dist = 20.0
@@ -151,7 +174,6 @@ def align_images(reference, target, ref_star_data, num_stars=20):
             pos_targ = targ_pos[idx]
             delta = pos_targ - pos_ref
             deltas.append(delta)
-            # Store for table: ref (x,y), original targ (x,y), aligned targ (x,y) = original - mean_delta
             matched_data.append({
                 'ref_x': pos_ref[0],
                 'ref_y': pos_ref[1],
@@ -168,7 +190,6 @@ def align_images(reference, target, ref_star_data, num_stars=20):
 
     aligned = shift(target, (aligned_shift_y, aligned_shift_x), order=5, mode='constant', cval=np.median(target))
 
-    # Add aligned positions to table
     for entry in matched_data:
         entry['aligned_x'] = entry['targ_x'] + aligned_shift_x
         entry['aligned_y'] = entry['targ_y'] + aligned_shift_y
@@ -183,12 +204,10 @@ def align_images(reference, target, ref_star_data, num_stars=20):
 # Main execution
 if __name__ == "__main__":
     try:
-        # Load images
         images_data, image_files = load_matching_fits_images(
             image_directory_path, prefix, suffix
         )
 
-        # Select first two images
         ref_img = images_data[0]
         targ_img = images_data[1]
         file1 = image_files[0]
@@ -198,27 +217,33 @@ if __name__ == "__main__":
         print(f"  Reference (fixed): {os.path.basename(file1)}")
         print(f"  Target: {os.path.basename(file2)}")
 
-        # Find stars in reference
         print("\nFinding stars in reference image...")
         ref_star_data = find_star_centroids_and_fwhms(ref_img, num_stars_for_alignment)
         fwhm_pixels = estimate_fwhm(ref_star_data)
         print(f"Estimated median FWHM: {fwhm_pixels:.2f} pixels")
 
-        # Find bright star for zoom
-        print("\nFinding a bright star for zoom...")
-        center_y, center_x = find_bright_star(ref_star_data)
-        print(f"Selected star at (x, y) = ({center_x:.1f}, {center_y:.1f})")
+        print("\nSelecting a different bright star (within 2000 px of center) for zoom...")
+        center_y, center_x, reference_star_peak = find_suitable_bright_star(ref_star_data, ref_img.shape)
+        print(f"Selected star at (x, y) = ({center_x:.2f}, {center_y:.2f})")
+        print(f"Maximum value at the peak pixel of this reference star: {reference_star_peak:.1f} counts")
         zoom_half_size = int(5 * fwhm_pixels)
 
-        # Compute unaligned difference
+        # Compute differences
         unaligned_diff = ref_img - targ_img
 
-        # Align using centroids
         print("\nAligning target image to reference using star centroids...")
         aligned_target, matched_centroids = align_images(ref_img, targ_img, ref_star_data, num_stars_for_alignment)
 
-        # Compute aligned difference
         aligned_diff = ref_img - aligned_target
+
+        # Local max in reference star (original image)
+        local_ref_patch = extract_local_patch(ref_img, center_y, center_x, radius=5)
+        local_ref_max = np.max(local_ref_patch)
+
+        # Local min/max in aligned difference around the same star
+        local_diff_patch = extract_local_patch(aligned_diff, center_y, center_x, radius=5)
+        local_diff_min = np.min(local_diff_patch)
+        local_diff_max = np.max(local_diff_patch)
 
         # Save differences
         unaligned_output_path = os.path.join(cwd, "unaligned_difference.fits")
@@ -226,23 +251,26 @@ if __name__ == "__main__":
         fits.PrimaryHDU(unaligned_diff).writeto(unaligned_output_path, overwrite=True)
         fits.PrimaryHDU(aligned_diff).writeto(aligned_output_path, overwrite=True)
 
-        # Print statistics
-        print("\nUnaligned difference:")
+        print("\nUnaligned difference (global):")
         print(f"  Mean: {np.mean(unaligned_diff):.4f}   Std: {np.std(unaligned_diff):.4f}")
-        print("\nAligned difference:")
-        print(f"  Mean: {np.mean(aligned_diff):.4f}   Std: {np.std(aligned_diff):.4f}")
+        print("\nAligned difference (final result):")
+        print(f"  Global mean: {np.mean(aligned_diff):.4f}   Global std: {np.std(aligned_diff):.4f}")
+        print(f"  Local (within 5 px of reference star) minimum: {local_diff_min:.1f}")
+        print(f"  Local (within 5 px of reference star) maximum: {local_diff_max:.1f}")
+        print(
+            f"\nNote: Local reference star max in original image: {local_ref_max:.1f} counts (should match peak above)")
         print(f"\nDifference images saved to:\n  {unaligned_output_path}\n  {aligned_output_path}")
 
-        # Print table of centroids
-        print("\n" + "=" * 80)
+        # Centroid table
+        print("\n" + "=" * 100)
         print("CENTROID TABLE FOR MATCHED STARS")
-        print("=" * 80)
-        df = pd.DataFrame(matched_centroids)
-        df = df[['ref_x', 'ref_y', 'targ_x', 'targ_y', 'aligned_x', 'aligned_y']]
-        df.columns = ['Ref X', 'Ref Y', 'Targ X', 'Targ Y', 'Aligned Targ X', 'Aligned Targ Y']
-        df = df.round(3)
-        print(df.to_string(index=False))
-        print("=" * 80)
+        print("=" * 100)
+        df_centroids = pd.DataFrame(matched_centroids)
+        df_centroids = df_centroids[['ref_x', 'ref_y', 'targ_x', 'targ_y', 'aligned_x', 'aligned_y']]
+        df_centroids.columns = ['Ref X', 'Ref Y', 'Targ X', 'Targ Y', 'Aligned Targ X', 'Aligned Targ Y']
+        df_centroids = df_centroids.round(3)
+        print(df_centroids.to_string(index=False))
+        print("=" * 100)
 
         # Display zoomed differences
         fig, axs = plt.subplots(1, 2, figsize=(20, 8), sharey=True)

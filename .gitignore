@@ -1,0 +1,13 @@
+# Finder turds:
+**/.DS_Store
+
+# Jupyter turds:
+**/.ipynb_checkpoints
+**/.swp
+
+# Python execution cache directories:
+**/__pycache__/
+
+# PyCharm files that are developer-specific:
+# Nothing needed because these are handled by
+# a .gitignore within each of the PyCharm projects
