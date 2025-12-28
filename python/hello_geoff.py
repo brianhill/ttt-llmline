@@ -185,6 +185,21 @@ def align_images(reference, target, ref_star_data, num_stars=20):
     shift_x, shift_y = mean_delta
     aligned_shift_y, aligned_shift_x = -shift_y, -shift_x
 
+    # ==============================================================================
+    # KEY STEP: Sub-pixel image displacement via interpolation
+    #
+    # The following line performs the actual alignment of the target image to the
+    # reference by shifting it by the computed (sub-pixel) offsets.
+    #
+    # - shift() from scipy.ndimage uses spline interpolation.
+    # - order=5 specifies 5th-order (quintic) spline interpolation for high accuracy.
+    # - mode='constant' fills areas outside the original image with a constant value.
+    # - cval=np.median(target) uses the median of the target image as the fill value
+    #   to avoid introducing bright or dark edges.
+    #
+    # This interpolation allows precise sub-pixel shifts without resampling artifacts
+    # that would degrade the subtraction quality.
+    # ==============================================================================
     aligned = shift(target, (aligned_shift_y, aligned_shift_x), order=5, mode='constant', cval=np.median(target))
 
     for entry in matched_data:
