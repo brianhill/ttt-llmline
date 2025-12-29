@@ -39,6 +39,10 @@ num_images_for_template = 7  # Number of first images to use for median template
 #        unsigned integers (no sign interpretation).
 #     2. Immediately convert to np.float32 → preserves the exact original values
 #        (0–65535) as positive floats and allows safe arithmetic without overflow.
+#     3. After conversion, any remaining negative values (which should not occur
+#        with proper calibration but can appear due to over-subtraction) are
+#        replaced with 32768.0 — the conventional "zero" level for unsigned 16-bit
+#        data (corresponding to BZERO in FITS headers).
 #
 # Benefits:
 # - Large UINT16 values (e.g., >32767) will never become negative.
@@ -74,8 +78,10 @@ def load_matching_fits_images(dir_path, file_prefix, file_suffix):
             if data is None:
                 raise ValueError(f"No image data in primary HDU of {filepath}")
             # Convert to float32 to preserve exact values and enable safe arithmetic
-            # This ensures values >32767 remain positive and no overflow occurs
-            image_arrays.append(np.array(data, dtype=np.float32))
+            float_data = np.array(data, dtype=np.float32)
+            # Replace any negative values (from over-subtraction) with 32768.0 (UINT16 zero level)
+            float_data[float_data < 0] = 32768.0
+            image_arrays.append(float_data)
 
     return image_arrays, matching_files
 
@@ -308,7 +314,8 @@ if __name__ == "__main__":
         plt.figure(figsize=(10, 10))
         plt.imshow(template_central, cmap='gray', origin='lower', vmin=np.percentile(template_central, 1),
                    vmax=np.percentile(template_central, 99))
-        plt.title('Central 1000×1000 pixels of the Median Template')
+        plt.title(
+            f'Central 1000×1000 pixels of the Median Template\nCenter pixel: ({center_x_t:.1f}, {center_y_t:.1f})')
         plt.xlabel('X pixel')
         plt.ylabel('Y pixel')
         plt.colorbar(label='Counts', shrink=0.8)
@@ -326,7 +333,7 @@ if __name__ == "__main__":
             central_i = aligned_img[cy_i - half:cy_i + half, cx_i - half:cx_i + half]
             im = axs[i].imshow(central_i, cmap='gray', origin='lower',
                                vmin=np.percentile(central_i, 1), vmax=np.percentile(central_i, 99))
-            axs[i].set_title(f'Image {i + 1} (aligned)')
+            axs[i].set_title(f'Image {i + 1} (aligned)\nCenter: ({cx_i:.1f}, {cy_i:.1f})')
             axs[i].set_xlabel('X pixel')
             axs[i].set_ylabel('Y pixel')
             fig.colorbar(im, ax=axs[i], shrink=0.8)
@@ -349,7 +356,7 @@ if __name__ == "__main__":
             central_orig = orig_img[cy_i - half:cy_i + half, cx_i - half:cx_i + half]
             im_un = axs_un[i].imshow(central_orig, cmap='gray', origin='lower',
                                      vmin=np.percentile(central_orig, 1), vmax=np.percentile(central_orig, 99))
-            axs_un[i].set_title(f'Image {i + 1} (original, unaligned)')
+            axs_un[i].set_title(f'Image {i + 1} (original, unaligned)\nCenter: ({cx_i:.1f}, {cy_i:.1f})')
             axs_un[i].set_xlabel('X pixel')
             axs_un[i].set_ylabel('Y pixel')
             fig_un.colorbar(im_un, ax=axs_un[i], shrink=0.8)
@@ -402,8 +409,10 @@ if __name__ == "__main__":
         print(f"  Mean: {np.mean(unaligned_diff):.4f}   Std: {np.std(unaligned_diff):.4f}")
         print("\nAligned difference (final result):")
         print(f"  Global mean: {np.mean(aligned_diff):.4f}   Global std: {np.std(aligned_diff):.4f}")
-        print(f"  Local (within 5 px of template star) minimum: {local_diff_min:.1f}")
-        print(f"  Local (within 5 px of template star) maximum: {local_diff_max:.1f}")
+        print(
+            f"  Local (within 5 px of template star at ({center_x:.1f}, {center_y:.1f})) minimum: {local_diff_min:.1f}")
+        print(
+            f"  Local (within 5 px of template star at ({center_x:.1f}, {center_y:.1f})) maximum: {local_diff_max:.1f}")
         print(
             f"\nNote: Local template star max in original image: {local_template_max:.1f} counts (should match peak above)")
         print(f"\nImages saved to:")
@@ -425,23 +434,28 @@ if __name__ == "__main__":
         # Display zoomed differences
         fig, axs = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
 
+        # Define relative coordinates from -15 to +15 around the selected star
+        rel_extent = [-15.5, 15.5, -15.5, 15.5]  # half-pixel offset for correct centering
+
         im0 = axs[0].imshow(unaligned_diff, cmap='RdBu', origin='lower',
-                            vmin=-np.std(unaligned_diff) * 3, vmax=np.std(unaligned_diff) * 3)
+                            vmin=-np.std(unaligned_diff) * 3, vmax=np.std(unaligned_diff) * 3,
+                            extent=rel_extent)
         axs[0].set_title(f'Unaligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
-                         f'FWHM ≈ {fwhm_pixels:.2f} px | Zoom on star at ({center_x:.1f}, {center_y:.1f})')
-        axs[0].set_xlabel('X pixel')
-        axs[0].set_ylabel('Y pixel')
-        axs[0].set_xlim(center_x - zoom_half_size, center_x + zoom_half_size)
-        axs[0].set_ylim(center_y - zoom_half_size, center_y + zoom_half_size)
+                         f'FWHM ≈ {fwhm_pixels:.2f} px | Center: ({center_x:.1f}, {center_y:.1f})')
+        axs[0].set_xlabel('ΔX from center (pixels)')
+        axs[0].set_ylabel('ΔY from center (pixels)')
+        axs[0].set_xlim(-15, 15)
+        axs[0].set_ylim(-15, 15)
         fig.colorbar(im0, ax=axs[0], label='Difference (counts)', shrink=0.8)
 
         im1 = axs[1].imshow(aligned_diff, cmap='RdBu', origin='lower',
-                            vmin=-np.std(aligned_diff) * 3, vmax=np.std(aligned_diff) * 3)
+                            vmin=-np.std(aligned_diff) * 3, vmax=np.std(aligned_diff) * 3,
+                            extent=rel_extent)
         axs[1].set_title(f'Aligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
-                         f'Alignment target: ±{target_alignment_accuracy:.2f} px')
-        axs[1].set_xlabel('X pixel')
-        axs[1].set_xlim(center_x - zoom_half_size, center_x + zoom_half_size)
-        axs[1].set_ylim(center_y - zoom_half_size, center_y + zoom_half_size)
+                         f'Alignment target: ±{target_alignment_accuracy:.2f} px | Center: ({center_x:.1f}, {center_y:.1f})')
+        axs[1].set_xlabel('ΔX from center (pixels)')
+        axs[1].set_xlim(-15, 15)
+        axs[1].set_ylim(-15, 15)
         fig.colorbar(im1, ax=axs[1], label='Difference (counts)', shrink=0.8)
 
         plt.tight_layout()
