@@ -27,24 +27,31 @@ num_images_for_template = 7  # Number of first images to use for median template
 #
 # Key points:
 # - The files are assumed to be fully calibrated science frames
-#   (i.e., bias, dark, and flat-field corrections already applied).
-# - Only the primary HDU data (hdul[0].data) is loaded.
-# - No additional processing (overscan, bias/dark subtraction, flat division,
-#   cosmic ray rejection, etc.) is performed here.
+#   (bias, dark, flat-field corrections already applied).
+# - Many astronomical cameras (including QHY series) store raw or calibrated
+#   pixel data as unsigned 16-bit integers (UINT16 / BITPIX=16, BZERO=32768, BSCALE=1).
+# - astropy.io.fits automatically handles the FITS scaling keywords (BSCALE/BZERO)
+#   and returns data as signed integers or floats, correctly mapping the unsigned
+#   range 0–65535 to positive values.
+# - However, to guarantee safe handling regardless of header keywords and to
+#   prevent any risk of negative values due to signed interpretation, we:
+#     1. Open with uint=True → forces astropy to treat the raw pixel data as
+#        unsigned integers (no sign interpretation).
+#     2. Immediately convert to np.float32 → preserves the exact original values
+#        (0–65535) as positive floats and allows safe arithmetic without overflow.
+#
+# Benefits:
+# - Large UINT16 values (e.g., >32767) will never become negative.
+# - All subsequent operations (subtraction, median, shifts) are performed in
+#   floating point with full precision.
 #
 # Potential sources of artifacts:
-# - If the calibration frames (bias, dark, flat) were imperfect or mismatched
-#   to the science frames (e.g., different temperature for darks, non-uniform
-#   flat illumination, incorrect bias level), residual patterns can remain.
-# - Common residual artifacts include:
-#   * Low-level gradients (left-right or top-bottom brightness differences)
-#   * Fixed-pattern noise not fully removed by the bias/dark
-#   * Vignetting or illumination gradients not fully corrected by the flat
-# - These systematic patterns will persist through alignment and median
-#   combination because they are present in every frame.
+# - If calibration produced negative values that were clipped to zero, or if
+#   BZERO/BSCALE were incorrect, residual patterns may remain.
+# - Residual flat-field gradients or illumination mismatches can persist.
 #
-# Recommendation: Visually inspect raw and calibrated frames to verify
-# calibration quality before advanced processing.
+# Recommendation: Always verify a few frames visually and check header keywords
+# (BITPIX, BZERO, BSCALE) to confirm data integrity.
 ###############################################################################
 def load_matching_fits_images(dir_path, file_prefix, file_suffix):
     pattern = os.path.join(dir_path, file_prefix + "*" + file_suffix)
@@ -61,10 +68,13 @@ def load_matching_fits_images(dir_path, file_prefix, file_suffix):
 
     image_arrays = []
     for filepath in matching_files:
-        with fits.open(filepath) as hdul:
+        # Open FITS with uint=True to correctly interpret unsigned integer data
+        with fits.open(filepath, uint=True) as hdul:
             data = hdul[0].data
             if data is None:
                 raise ValueError(f"No image data in primary HDU of {filepath}")
+            # Convert to float32 to preserve exact values and enable safe arithmetic
+            # This ensures values >32767 remain positive and no overflow occurs
             image_arrays.append(np.array(data, dtype=np.float32))
 
     return image_arrays, matching_files
