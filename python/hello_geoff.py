@@ -20,6 +20,32 @@ num_stars_for_alignment = 20
 num_images_for_template = 7  # Number of first images to use for median template
 
 
+###############################################################################
+# IMAGE LOADING BLOCK
+#
+# This section reads the calibrated FITS images from disk.
+#
+# Key points:
+# - The files are assumed to be fully calibrated science frames
+#   (i.e., bias, dark, and flat-field corrections already applied).
+# - Only the primary HDU data (hdul[0].data) is loaded.
+# - No additional processing (overscan, bias/dark subtraction, flat division,
+#   cosmic ray rejection, etc.) is performed here.
+#
+# Potential sources of artifacts:
+# - If the calibration frames (bias, dark, flat) were imperfect or mismatched
+#   to the science frames (e.g., different temperature for darks, non-uniform
+#   flat illumination, incorrect bias level), residual patterns can remain.
+# - Common residual artifacts include:
+#   * Low-level gradients (left-right or top-bottom brightness differences)
+#   * Fixed-pattern noise not fully removed by the bias/dark
+#   * Vignetting or illumination gradients not fully corrected by the flat
+# - These systematic patterns will persist through alignment and median
+#   combination because they are present in every frame.
+#
+# Recommendation: Visually inspect raw and calibrated frames to verify
+# calibration quality before advanced processing.
+###############################################################################
 def load_matching_fits_images(dir_path, file_prefix, file_suffix):
     pattern = os.path.join(dir_path, file_prefix + "*" + file_suffix)
     matching_files = sorted(glob.glob(pattern))
@@ -199,7 +225,7 @@ def align_images(template, target, template_star_data, num_stars=20):
     #   to avoid introducing bright or dark edges.
     #
     # This interpolation allows precise sub-pixel shifts without resampling artifacts
-    # that would degrade the subtraction quality.
+    #   that would degrade the subtraction quality.
     # ==============================================================================
     aligned = shift(target, (aligned_shift_y, aligned_shift_x), order=5, mode='constant', cval=np.median(target))
 
@@ -262,6 +288,68 @@ if __name__ == "__main__":
 
         template_img = np.median(aligned_first_images, axis=0)
         print("Median template created.")
+
+        # Display central 1000×1000 of the template
+        ny, nx = template_img.shape
+        half = 500
+        center_y_t, center_x_t = ny // 2, nx // 2
+        template_central = template_img[center_y_t - half:center_y_t + half, center_x_t - half:center_x_t + half]
+
+        plt.figure(figsize=(10, 10))
+        plt.imshow(template_central, cmap='gray', origin='lower', vmin=np.percentile(template_central, 1),
+                   vmax=np.percentile(template_central, 99))
+        plt.title('Central 1000×1000 pixels of the Median Template')
+        plt.xlabel('X pixel')
+        plt.ylabel('Y pixel')
+        plt.colorbar(label='Counts', shrink=0.8)
+        plt.tight_layout()
+        plt.show()
+
+        # Display central 1000×1000 of all seven aligned images used for the template
+        print("\nDisplaying central 1000×1000 pixels of the seven aligned images used to build the template...")
+        fig, axs = plt.subplots(2, 4, figsize=(20, 10))
+        axs = axs.ravel()
+
+        for i, aligned_img in enumerate(aligned_first_images):
+            ny_i, nx_i = aligned_img.shape
+            cy_i, cx_i = ny_i // 2, nx_i // 2
+            central_i = aligned_img[cy_i - half:cy_i + half, cx_i - half:cx_i + half]
+            im = axs[i].imshow(central_i, cmap='gray', origin='lower',
+                               vmin=np.percentile(central_i, 1), vmax=np.percentile(central_i, 99))
+            axs[i].set_title(f'Image {i + 1} (aligned)')
+            axs[i].set_xlabel('X pixel')
+            axs[i].set_ylabel('Y pixel')
+            fig.colorbar(im, ax=axs[i], shrink=0.8)
+
+        # Hide the empty 8th subplot
+        axs[7].axis('off')
+
+        plt.suptitle('Central 1000×1000 pixels of the 7 aligned images used for the median template')
+        plt.tight_layout()
+        plt.show()
+
+        # Display central 1000×1000 of the original (unaligned) seven images
+        print("\nDisplaying central 1000×1000 pixels of the original (unaligned) seven images used for the template...")
+        fig_un, axs_un = plt.subplots(2, 4, figsize=(20, 10))
+        axs_un = axs_un.ravel()
+
+        for i, orig_img in enumerate(first_images):
+            ny_i, nx_i = orig_img.shape
+            cy_i, cx_i = ny_i // 2, nx_i // 2
+            central_orig = orig_img[cy_i - half:cy_i + half, cx_i - half:cx_i + half]
+            im_un = axs_un[i].imshow(central_orig, cmap='gray', origin='lower',
+                                     vmin=np.percentile(central_orig, 1), vmax=np.percentile(central_orig, 99))
+            axs_un[i].set_title(f'Image {i + 1} (original, unaligned)')
+            axs_un[i].set_xlabel('X pixel')
+            axs_un[i].set_ylabel('Y pixel')
+            fig_un.colorbar(im_un, ax=axs_un[i], shrink=0.8)
+
+        # Hide the empty 8th subplot
+        axs_un[7].axis('off')
+
+        plt.suptitle('Central 1000×1000 pixels of the 7 original (unaligned) images used for the median template')
+        plt.tight_layout()
+        plt.show()
 
         fwhm_pixels = estimate_fwhm(template_star_data)
         print(f"Estimated median FWHM (from first image): {fwhm_pixels:.2f} pixels")
