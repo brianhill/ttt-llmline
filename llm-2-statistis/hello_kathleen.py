@@ -250,16 +250,16 @@ def align_images(template, target, template_star_data, num_stars=20):
 
     # ==============================================================================
     # KEY STEP: Sub-pixel image displacement via interpolation
-    #
+    # 
     # The following line performs the actual alignment of the target image to the
     # template by shifting it by the computed (sub-pixel) offsets.
-    #
+    # 
     # - shift() from scipy.ndimage uses spline interpolation.
     # - order=5 specifies 5th-order (quintic) spline interpolation for high accuracy.
     # - mode='constant' fills areas outside the original image with a constant value.
     # - cval=np.median(target) uses the median of the target image as the fill value
     #   to avoid introducing bright or dark edges.
-    #
+    # 
     # This interpolation allows precise sub-pixel shifts without resampling artifacts
     #   that would degrade the subtraction quality.
     # ==============================================================================
@@ -316,6 +316,18 @@ if __name__ == "__main__":
         first_images = images_data[:num_images_for_template]
         template_base = first_images[0]
         template_star_data = find_star_centroids_and_fwhms(template_base, num_stars_for_alignment)
+
+        # NEW: Eliminate stars within 200 pixels of image edges
+        ny, nx = template_base.shape
+        edge_margin = 200
+        filtered_star_data = []
+        for full_x, full_y, fwhm, peak in template_star_data:
+            if (full_x >= edge_margin and full_x <= nx - edge_margin and
+                    full_y >= edge_margin and full_y <= ny - edge_margin):
+                filtered_star_data.append((full_x, full_y, fwhm, peak))
+
+        template_star_data = filtered_star_data
+        print(f"After edge filtering: {len(template_star_data)} stars remain for alignment and photometry.")
 
         aligned_first_images = [template_base]  # First image is already aligned to itself
         for img in first_images[1:]:
@@ -406,17 +418,17 @@ if __name__ == "__main__":
 
         aligned_diff = template_img - aligned_target
 
-        # NEW: Aperture photometry table for the 20 stars
-        print("\nComputing aperture photometry for the 20 alignment stars...")
+        # NEW: Aperture photometry table for the stars (now edge-filtered)
+        print("\nComputing aperture photometry for the alignment stars...")
         photometry_data = []
-        y_grid, x_grid = np.indices(template_img.shape)  # Grids for template (same for aligned_target)
+        y_grid, x_grid = np.indices(template_img.shape)
 
         for i, (full_x, full_y, fwhm, peak) in enumerate(template_star_data):
             dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
             aperture_mask = dist_sq <= aperture_radius ** 2
 
             template_sum = np.sum(template_img[aperture_mask])
-            science_sum = np.sum(aligned_target[aperture_mask])  # Aligned science image
+            science_sum = np.sum(aligned_target[aperture_mask])
 
             photometry_data.append({
                 'Star': i + 1,
