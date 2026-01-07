@@ -20,6 +20,8 @@ num_stars_for_alignment = 20
 num_images_for_template = 7  # Number of first images to use for median template
 saturation_threshold = 60000.0  # Dismiss stars with peak > this value (likely saturated)
 duplicate_distance_threshold = 3.0  # Pixels; skip if centroid within this distance of existing
+aperture_radius = 5.0  # Radius for aperture checks
+aperture_max_threshold = 10000.0  # Dismiss stars if any pixel in aperture > this value
 
 
 ###############################################################################
@@ -110,6 +112,9 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
     # List to track existing centroids for de-duplication
     existing_centroids = []
 
+    # Pre-compute coordinate grids for aperture checks
+    y_grid, x_grid = np.indices(image_data.shape)
+
     for i in range(min(len(sorted_peaks_y), num_stars * 5)):  # Try more to fill after filtering
         y = sorted_peaks_y[i]
         x = sorted_peaks_x[i]
@@ -141,8 +146,14 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
                 full_y = y0 + g_fit.y_mean.value
                 peak_pixel = image_data[int(np.round(full_y)), int(np.round(full_x))]
 
-                # Dismiss saturated stars
+                # Dismiss saturated stars (peak pixel)
                 if peak_pixel > saturation_threshold:
+                    continue
+
+                # Additional check: dismiss if any pixel in 5-pixel aperture > 10000
+                dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
+                aperture_mask = dist_sq <= aperture_radius ** 2
+                if np.max(image_data[aperture_mask]) > aperture_max_threshold:
                     continue
 
                 # De-duplicate: check distance to existing centroids
@@ -177,32 +188,19 @@ def estimate_fwhm(star_data):
     return np.median(fwhms)
 
 
-def find_suitable_bright_star(star_data, image_shape, max_dist_from_center=2000.0):
-    ny, nx = image_shape
-    cy, cx = ny / 2.0, nx / 2.0
+# Uses stars from the entire image
+def find_suitable_bright_star(star_data, image_shape):
+    if len(star_data) < 2:
+        raise ValueError("Fewer than 2 stars found in the image.")
 
-    candidates = []
-    for x, y, _, peak in star_data:
-        dist_to_center = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
-        if dist_to_center <= max_dist_from_center:
-            candidates.append((dist_to_center, peak, x, y))
+    # Sort by brightness (peak pixel) descending
+    sorted_stars = sorted(star_data, key=lambda s: s[3], reverse=True)
 
-    if len(candidates) < 2:
-        raise ValueError("Fewer than 2 stars found within 2000 px of the image center.")
+    # Select the SECOND brightest star
+    selected = sorted_stars[1]
+    full_x, full_y, _, selected_peak = selected
 
-    candidates.sort(key=lambda t: (t[0], -t[1]))
-
-    # Select the SECOND candidate
-    _, _, best_x, best_y = candidates[1]
-
-    for entry in star_data:
-        if abs(entry[0] - best_x) < 0.1 and abs(entry[1] - best_y) < 0.1:
-            selected_peak = entry[3]
-            break
-    else:
-        selected_peak = 0.0
-
-    return best_y, best_x, selected_peak
+    return full_y, full_x, selected_peak
 
 
 def extract_local_patch(image, center_y, center_x, radius=5):
@@ -393,7 +391,7 @@ if __name__ == "__main__":
         fwhm_pixels = estimate_fwhm(template_star_data)
         print(f"Estimated median FWHM (from first image): {fwhm_pixels:.2f} pixels")
 
-        print("\nSelecting a different bright star (within 2000 px of center) for zoom...")
+        print("\nSelecting a different bright star for zoom...")
         center_y, center_x, template_star_peak = find_suitable_bright_star(template_star_data, template_img.shape)
         print(f"Selected star at (x, y) = ({center_x:.2f}, {center_y:.2f})")
         print(f"Maximum value at the peak pixel of this template star: {template_star_peak:.1f} counts")
@@ -407,6 +405,36 @@ if __name__ == "__main__":
                                                          num_stars_for_alignment)
 
         aligned_diff = template_img - aligned_target
+
+        # NEW: Aperture photometry table for the 20 stars
+        print("\nComputing aperture photometry for the 20 alignment stars...")
+        photometry_data = []
+        y_grid, x_grid = np.indices(template_img.shape)  # Grids for template (same for aligned_target)
+
+        for i, (full_x, full_y, fwhm, peak) in enumerate(template_star_data):
+            dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
+            aperture_mask = dist_sq <= aperture_radius ** 2
+
+            template_sum = np.sum(template_img[aperture_mask])
+            science_sum = np.sum(aligned_target[aperture_mask])  # Aligned science image
+
+            photometry_data.append({
+                'Star': i + 1,
+                'X': round(full_x, 2),
+                'Y': round(full_y, 2),
+                'Template Counts': round(template_sum),
+                'Science Counts': round(science_sum)
+            })
+
+        df_phot = pd.DataFrame(photometry_data)
+        print("\n" + "=" * 80)
+        print("APERTURE PHOTOMETRY TABLE (5-pixel radius)")
+        print("=" * 80)
+        print(df_phot.to_string(index=False))
+        print("=" * 80)
+
+        print(f"\nAverage template counts: {np.mean(df_phot['Template Counts']):.0f}")
+        print(f"Average science counts (aligned): {np.mean(df_phot['Science Counts']):.0f}")
 
         # Local max in template star (original image)
         local_template_patch = extract_local_patch(template_img, center_y, center_x, radius=5)
