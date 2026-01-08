@@ -502,6 +502,14 @@ if __name__ == "__main__":
         local_diff_min = np.min(local_diff_patch)
         local_diff_max = np.max(local_diff_patch)
 
+        # NEW: Save the template and rescaled science images as NumPy arrays
+        template_npy_path = os.path.join(cwd, "median_template.npy")
+        rescaled_science_npy_path = os.path.join(cwd, "rescaled_aligned_science.npy")
+        np.save(template_npy_path, template_img)
+        np.save(rescaled_science_npy_path, scaled_aligned_target)
+        print(f"\nSaved template image as NumPy array: {template_npy_path}")
+        print(f"Saved rescaled science image as NumPy array: {rescaled_science_npy_path}")
+
         # Save the scaled difference as the final result
         scaled_aligned_output_path = os.path.join(cwd, "scaled_aligned_template_last_difference.fits")
         fits.PrimaryHDU(scaled_aligned_diff).writeto(scaled_aligned_output_path, overwrite=True)
