@@ -299,8 +299,8 @@ candidates = final_candidates
 
 print(f"After secondary Poisson culling: {len(candidates)} candidates remain")
 
-# Fit each final candidate to master PSF + local background over 5x5 region
-print("\nFitting final candidates to master PSF + local background (5x5 region)...")
+# Fit each final candidate to master PSF + local background over 5x5 region (background >= 0)
+print("\nFitting final candidates to master PSF + local background (5x5 region, background >= 0)...")
 
 # Crop master PSF to central 5x5 for fitting
 psf_fit_size = 5
@@ -310,7 +310,7 @@ master_psf_central = master_psf[half_cut - psf_half:half_cut + psf_half + 1,
 
 # Flatten for fitting
 psf_vec = master_psf_central.flatten()
-psf_sum = np.sum(psf_vec)  # For flux calculation
+psf_sum = np.sum(psf_vec)
 
 fit_results = []
 for i, (x, y) in enumerate(candidates):
@@ -326,14 +326,21 @@ for i, (x, y) in enumerate(candidates):
     # Design matrix: PSF vector and constant for background
     design = np.vstack([psf_vec, np.ones(psf_fit_size ** 2)]).T
 
-    # Least squares fit
-    params, residuals, rank, s = np.linalg.lstsq(design, data_vec, rcond=None)
+    # Unconstrained least squares fit
+    params = np.linalg.lstsq(design, data_vec, rcond=None)[0]
     amplitude, background = params
+
+    # Enforce background >= 0
+    if background < 0:
+        # Fix background to 0 and refit amplitude only
+        design_fixed = psf_vec[:, np.newaxis]
+        amplitude = np.linalg.lstsq(design_fixed, data_vec, rcond=None)[0][0]
+        background = 0.0
 
     # Total flux
     flux = amplitude * psf_sum
 
-    # Chi-squared
+    # Final model and chi-squared
     model = amplitude * psf_vec + background
     chi2 = np.sum((data_vec - model) ** 2)
     dof = psf_fit_size ** 2 - 2
@@ -341,14 +348,14 @@ for i, (x, y) in enumerate(candidates):
 
     fit_results.append((flux, background, chi2_dof))
 
-# Tertiary culling: remove candidates with chi2/dof > 10
-print("\nTertiary culling: eliminating candidates with chi²/dof > 10...")
+# Tertiary culling: remove candidates with chi2/dof > 30
+print("\nTertiary culling: eliminating candidates with chi²/dof > 30...")
 good_fit_candidates = []
 good_fit_results = []
 
 for i in range(len(candidates)):
     chi2_dof = fit_results[i][2]
-    if chi2_dof <= 10.0:
+    if chi2_dof <= 30.0:
         good_fit_candidates.append(candidates[i])
         good_fit_results.append(fit_results[i])
 
@@ -359,7 +366,7 @@ print(f"After chi²/dof culling: {len(candidates)} candidates remain")
 
 # Print revised table with fit parameters
 if len(candidates) > 0:
-    print("Revised final candidates with PSF fit parameters (5x5 region):")
+    print("Revised final candidates with PSF fit parameters (5x5 region, background >= 0):")
     print("  #    (x, y)      residual    flux       background   chi2/dof")
     for i in range(len(candidates)):
         x, y = candidates[i]
