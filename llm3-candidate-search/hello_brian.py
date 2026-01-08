@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.patches import Circle
 from scipy.ndimage import uniform_filter
 
 # Corrected directory containing the NumPy files (relative path)
@@ -42,9 +43,8 @@ abs_difference = np.abs(difference)
 abs_median = np.median(abs_difference)
 print(f"\nAbsolute difference median: {abs_median:.1f} counts")
 
-# NEW: 3×3 boxcar sum-smoothed difference
+# 3×3 boxcar sum-smoothed difference
 print("\nCreating 3×3 boxcar sum-smoothed difference image...")
-# uniform_filter computes average; multiply by 9 to get sum
 smoothed_sum_difference = uniform_filter(difference, size=3) * 9
 
 # Absolute value of the sum-smoothed difference
@@ -54,28 +54,120 @@ abs_smoothed_sum = np.abs(smoothed_sum_difference)
 smoothed_abs_median = np.median(abs_smoothed_sum)
 print(f"Median of absolute sum-smoothed difference: {smoothed_abs_median:.1f} counts")
 
-# Reintroduce median_multiplier and compute threshold
-median_multiplier = 5
+# Median multiplier and threshold
+median_multiplier = 10
 threshold = smoothed_abs_median * median_multiplier
 print(f"Median multiplier: {median_multiplier}")
 print(f"Threshold (median × {median_multiplier}): {threshold:.1f} counts")
 
-# Identify candidates: pixels where absolute sum-smoothed difference exceeds threshold
-print("\nFinding candidate pixels exceeding threshold...")
+# Initial candidates: pixels exceeding threshold
+print("\nFinding initial candidate pixels exceeding threshold...")
 y_indices, x_indices = np.where(abs_smoothed_sum > threshold)
-candidates = list(zip(x_indices, y_indices))  # List of (x, y) tuples
+candidates = list(zip(x_indices, y_indices))
+values = abs_smoothed_sum[y_indices, x_indices].tolist()
 
-print(f"Found {len(candidates)} candidate pixels")
+print(f"Found {len(candidates)} initial candidate pixels")
+
+# Print first 20 initial candidates
 if len(candidates) > 0:
-    print("First 20 candidates (x, y):")
+    print("First 20 initial candidates (x, y) with values:")
+    for i in range(min(20, len(candidates))):
+        x, y = candidates[i]
+        val = values[i]
+        print(f"  {i+1:2d}: ({x}, {y}) value = {val:.1f}")
+else:
+    print("No initial candidates found.")
+
+# Edge culling: eliminate candidates within 50 pixels of image edges
+print("\nEdge culling: eliminating candidates within 50 pixels of image edges...")
+ny, nx = abs_smoothed_sum.shape
+edge_margin_candidates = 50
+edge_culled = []
+for i in range(len(candidates)):
+    x, y = candidates[i]
+    val = values[i]
+    if (x >= edge_margin_candidates and x <= nx - edge_margin_candidates and
+        y >= edge_margin_candidates and y <= ny - edge_margin_candidates):
+        edge_culled.append(((x, y), val))
+
+candidates = [coord for coord, _ in edge_culled]
+values = [val for _, val in edge_culled]
+
+print(f"After edge culling: {len(candidates)} candidates remain")
+
+# Adjacency culling: keep only the brightest within 5 pixels
+print("\nAdjacency culling: keeping brightest within 5 pixels...")
+culled_candidates = []
+
+# Convert values to NumPy array for safe sorting
+values_array = np.array(values)
+sorted_indices = np.argsort(-values_array)
+sorted_candidates = [candidates[i] for i in sorted_indices]
+
+for i, (x, y) in enumerate(sorted_candidates):
+    too_close = False
+    for cx, cy in culled_candidates:
+        dist = np.sqrt((x - cx)**2 + (y - cy)**2)
+        if dist <= 5.0:
+            too_close = True
+            break
+    if not too_close:
+        culled_candidates.append((x, y))
+
+candidates = culled_candidates
+
+print(f"After adjacency culling: {len(candidates)} unique bright candidates remain")
+
+# 3×3 boxcar sum-smoothed template
+print("\nCreating 3×3 boxcar sum-smoothed template image...")
+smoothed_template = uniform_filter(template_img, size=3) * 9
+
+# Secondary culling using Poisson noise estimate
+poisson_multiplier = 10
+print(f"\nSecondary culling with poisson_multiplier = {poisson_multiplier}")
+
+final_candidates = []
+for x, y in candidates:
+    smoothed_template_val = smoothed_template[y, x]
+    effective_val = max(smoothed_template_val, 1.0)
+    poisson_threshold = poisson_multiplier * np.sqrt(effective_val)
+    candidate_val = abs_smoothed_sum[y, x]
+    if candidate_val >= poisson_threshold:
+        final_candidates.append((x, y))
+
+candidates = final_candidates
+
+print(f"After secondary Poisson culling: {len(candidates)} candidates remain")
+if len(candidates) > 0:
+    print("First 20 final candidates (x, y) with values:")
     for i in range(min(20, len(candidates))):
         x, y = candidates[i]
         val = abs_smoothed_sum[y, x]
         print(f"  {i+1:2d}: ({x}, {y}) value = {val:.1f}")
 else:
-    print("No candidates exceed the threshold.")
+    print("No candidates remain after secondary culling.")
 
-# Display central 2000×2000 regions in a 2×2 grid
+# Display FULL rescaled science image with red circles (diameter 20 px) around final candidates
+print("\nDisplaying FULL rescaled science image with red circles (diameter 20 px) on all final candidates...")
+fig_science_full, ax_science_full = plt.subplots(1, 1, figsize=(20, 20))
+im_science_full = ax_science_full.imshow(rescaled_science_img, cmap='gray', origin='lower',
+                                         vmin=np.percentile(rescaled_science_img, 1),
+                                         vmax=np.percentile(rescaled_science_img, 99))
+
+for x, y in candidates:
+    circ = Circle((x, y), radius=10, fill=False, color='red', linewidth=2)
+    ax_science_full.add_patch(circ)
+
+ax_science_full.set_title(f'Full Rescaled Aligned Science Image\nRed circles (diameter 20 px) on all {len(candidates)} final candidates')
+ax_science_full.set_xlabel('X pixel')
+ax_science_full.set_ylabel('Y pixel')
+fig_science_full.colorbar(im_science_full, ax=ax_science_full, shrink=0.8, label='Counts')
+plt.tight_layout()
+plt.show()
+
+print(f"All {len(candidates)} final candidates are marked on the full image.")
+
+# Pre-compute central 2000×2000 regions for other displays
 half_large = 1000
 ny, nx = template_img.shape
 center_y_large, center_x_large = ny // 2, nx // 2
