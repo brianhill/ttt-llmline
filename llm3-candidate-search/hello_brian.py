@@ -2,7 +2,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
-from scipy.ndimage import maximum_filter, uniform_filter
+from scipy.ndimage import maximum_filter, shift, uniform_filter
 from astropy.modeling import models, fitting
 
 # Corrected directory containing the NumPy files (relative path)
@@ -17,114 +17,6 @@ if not os.path.exists(template_path):
     raise FileNotFoundError(f"Template file not found: {template_path}")
 if not os.path.exists(rescaled_science_path):
     raise FileNotFoundError(f"Rescaled science file not found: {rescaled_science_path}")
-
-# Constants for star finding and culling
-saturation_threshold = 60000.0
-aperture_radius = 5.0
-aperture_max_threshold = 10000.0
-edge_margin = 200
-duplicate_distance_threshold = 3.0
-
-
-# Function to find star centroids and FWHM (defined early so it can be used for PSF characterization)
-def find_star_centroids_and_fwhms(image_data, num_stars=20):
-    background = np.median(image_data)
-    data_sub = image_data - background
-
-    local_max = maximum_filter(data_sub, size=15) == data_sub
-    peaks = np.where(local_max & (data_sub > 5 * np.std(data_sub)))
-
-    if len(peaks[0]) == 0:
-        raise ValueError("No bright sources detected.")
-
-    star_data = []
-    box_half_size = 15
-    fitter = fitting.LevMarLSQFitter()
-
-    intensities = data_sub[peaks[0], peaks[1]]
-    sorted_indices = np.argsort(-intensities)
-    sorted_peaks_y = peaks[0][sorted_indices]
-    sorted_peaks_x = peaks[1][sorted_indices]
-
-    # List to track existing centroids for de-duplication
-    existing_centroids = []
-
-    # Pre-compute coordinate grids for aperture checks
-    y_grid, x_grid = np.indices(image_data.shape)
-
-    # Image dimensions for edge filtering
-    ny, nx = image_data.shape
-
-    for i in range(min(len(sorted_peaks_y), num_stars * 5)):
-        y = sorted_peaks_y[i]
-        x = sorted_peaks_x[i]
-
-        y0, y1 = max(0, y - box_half_size), min(image_data.shape[0], y + box_half_size + 1)
-        x0, x1 = max(0, x - box_half_size), min(image_data.shape[1], x + box_half_size + 1)
-        cutout = data_sub[y0:y1, x0:x1]
-
-        if cutout.size < 100:
-            continue
-
-        yy, xx = np.mgrid[:cutout.shape[0], :cutout.shape[1]]
-        y_center = y - y0
-        x_center = x - x0
-
-        g_init = models.Gaussian2D(
-            amplitude=cutout.max(),
-            x_mean=x_center,
-            y_mean=y_center,
-            x_stddev=3.0,
-            y_stddev=3.0
-        )
-
-        try:
-            g_fit = fitter(g_init, xx, yy, cutout)
-            if g_fit.x_stddev.value > 0 and g_fit.y_stddev.value > 0:
-                fwhm_mean = np.mean([g_fit.x_stddev.value * 2.355, g_fit.y_stddev.value * 2.355])
-                full_x = x0 + g_fit.x_mean.value
-                full_y = y0 + g_fit.y_mean.value
-                peak_pixel = image_data[int(np.round(full_y)), int(np.round(full_x))]
-
-                # Dismiss saturated stars
-                if peak_pixel > saturation_threshold:
-                    continue
-
-                # Dismiss if any pixel in aperture > threshold
-                dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
-                aperture_mask = dist_sq <= aperture_radius ** 2
-                if np.max(image_data[aperture_mask]) > aperture_max_threshold:
-                    continue
-
-                # Eliminate stars near edges
-                if (full_x < edge_margin or full_x > nx - edge_margin or
-                        full_y < edge_margin or full_y > ny - edge_margin):
-                    continue
-
-                # De-duplicate
-                too_close = False
-                for ex_x, ex_y in existing_centroids:
-                    dist = np.sqrt((full_x - ex_x) ** 2 + (full_y - ex_y) ** 2)
-                    if dist < duplicate_distance_threshold:
-                        too_close = True
-                        break
-                if too_close:
-                    continue
-
-                # Accept
-                star_data.append((full_x, full_y, fwhm_mean, peak_pixel))
-                existing_centroids.append((full_x, full_y))
-        except Exception:
-            continue
-
-        if len(star_data) >= num_stars:
-            break
-
-    if len(star_data) < num_stars:
-        print(f"Warning: Only found {len(star_data)} unique non-saturated non-edge star fits (requested {num_stars}).")
-
-    return star_data
-
 
 # Load the NumPy arrays
 print("Loading NumPy arrays...")
@@ -171,7 +63,175 @@ threshold = smoothed_abs_median * median_multiplier
 print(f"Median multiplier: {median_multiplier}")
 print(f"Threshold (median × {median_multiplier}): {threshold:.1f} counts")
 
-# Initial candidates: pixels exceeding threshold
+# Constants for star finding and culling
+saturation_threshold = 60000.0
+aperture_radius = 5.0
+aperture_max_threshold = 10000.0
+edge_margin = 200
+duplicate_distance_threshold = 3.0
+
+
+# Function to find star centroids and FWHM
+def find_star_centroids_and_fwhms(image_data, num_stars=20):
+    background = np.median(image_data)
+    data_sub = image_data - background
+
+    local_max = maximum_filter(data_sub, size=15) == data_sub
+    peaks = np.where(local_max & (data_sub > 5 * np.std(data_sub)))
+
+    if len(peaks[0]) == 0:
+        raise ValueError("No bright sources detected.")
+
+    star_data = []
+    box_half_size = 15
+    fitter = fitting.LevMarLSQFitter()
+
+    intensities = data_sub[peaks[0], peaks[1]]
+    sorted_indices = np.argsort(-intensities)
+    sorted_peaks_y = peaks[0][sorted_indices]
+    sorted_peaks_x = peaks[1][sorted_indices]
+
+    existing_centroids = []
+    y_grid, x_grid = np.indices(image_data.shape)
+    ny, nx = image_data.shape
+
+    for i in range(min(len(sorted_peaks_y), num_stars * 5)):
+        y = sorted_peaks_y[i]
+        x = sorted_peaks_x[i]
+
+        y0, y1 = max(0, y - box_half_size), min(image_data.shape[0], y + box_half_size + 1)
+        x0, x1 = max(0, x - box_half_size), min(image_data.shape[1], x + box_half_size + 1)
+        cutout = data_sub[y0:y1, x0:x1]
+
+        if cutout.size < 100:
+            continue
+
+        yy, xx = np.mgrid[:cutout.shape[0], :cutout.shape[1]]
+        y_center = y - y0
+        x_center = x - x0
+
+        g_init = models.Gaussian2D(
+            amplitude=cutout.max(),
+            x_mean=x_center,
+            y_mean=y_center,
+            x_stddev=3.0,
+            y_stddev=3.0
+        )
+
+        try:
+            g_fit = fitter(g_init, xx, yy, cutout)
+            if g_fit.x_stddev.value > 0 and g_fit.y_stddev.value > 0:
+                fwhm_mean = np.mean([g_fit.x_stddev.value * 2.355, g_fit.y_stddev.value * 2.355])
+                full_x = x0 + g_fit.x_mean.value
+                full_y = y0 + g_fit.y_mean.value
+                peak_pixel = image_data[int(np.round(full_y)), int(np.round(full_x))]
+
+                if peak_pixel > saturation_threshold:
+                    continue
+
+                dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
+                aperture_mask = dist_sq <= aperture_radius ** 2
+                if np.max(image_data[aperture_mask]) > aperture_max_threshold:
+                    continue
+
+                if (full_x < edge_margin or full_x > nx - edge_margin or
+                        full_y < edge_margin or full_y > ny - edge_margin):
+                    continue
+
+                too_close = False
+                for ex_x, ex_y in existing_centroids:
+                    dist = np.sqrt((full_x - ex_x) ** 2 + (full_y - ex_y) ** 2)
+                    if dist < duplicate_distance_threshold:
+                        too_close = True
+                        break
+                if too_close:
+                    continue
+
+                star_data.append((full_x, full_y, fwhm_mean, peak_pixel))
+                existing_centroids.append((full_x, full_y))
+        except Exception:
+            continue
+
+        if len(star_data) >= num_stars:
+            break
+
+    if len(star_data) < num_stars:
+        print(f"Warning: Only found {len(star_data)} unique non-saturated non-edge star fits (requested {num_stars}).")
+
+    return star_data
+
+
+# Characterize PSF in the median template image
+print("\nCharacterizing PSF in the median template image...")
+template_psf_data = find_star_centroids_and_fwhms(template_img, num_stars=50)
+
+if len(template_psf_data) == 0:
+    print("No suitable stars found for PSF characterization in template.")
+else:
+    fwhms = [fwhm for _, _, fwhm, _ in template_psf_data]
+    median_fwhm = np.median(fwhms)
+    mean_fwhm = np.mean(fwhms)
+    std_fwhm = np.std(fwhms)
+    print(f"PSF characterization using {len(template_psf_data)} isolated, non-saturated stars:")
+    print(f"  Median FWHM: {median_fwhm:.2f} pixels")
+    print(f"  Mean FWHM: {mean_fwhm:.2f} pixels (± {std_fwhm:.2f} pixels)")
+    print("  The PSF is modeled as the distribution of 2D Gaussian FWHM fits to these stars.")
+    print("  Individual star FWHM values are stored in template_psf_data for potential further analysis.")
+
+# Create master empirical PSF by stacking cutouts from PSF stars
+print("\nCreating master empirical PSF by stacking cutouts from PSF stars...")
+cutout_size = 41
+half_cut = cutout_size // 2
+psf_cutouts = []
+
+ny, nx = template_img.shape
+
+for full_x, full_y, _, _ in template_psf_data:
+    x0 = int(np.floor(full_x - half_cut))
+    x1 = int(np.floor(full_x + half_cut + 1))
+    y0 = int(np.floor(full_y - half_cut))
+    y1 = int(np.floor(full_y + half_cut + 1))
+
+    pad_left = max(0, -x0)
+    pad_right = max(0, x1 - nx)
+    pad_top = max(0, -y0)
+    pad_bottom = max(0, y1 - ny)
+
+    cutout = template_img[max(0, y0):min(ny, y1), max(0, x0):min(nx, x1)]
+    cutout = np.pad(cutout, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='constant', constant_values=0)
+
+    shift_y = half_cut + pad_top - (full_y - max(0, y0))
+    shift_x = half_cut + pad_left - (full_x - max(0, x0))
+    cutout = shift(cutout, (shift_y, shift_x), order=3, mode='constant', cval=0.0)
+
+    total_flux = np.sum(cutout)
+    if total_flux > 0:
+        cutout /= total_flux
+
+    psf_cutouts.append(cutout)
+
+if len(psf_cutouts) > 0:
+    master_psf = np.median(psf_cutouts, axis=0)
+    print(
+        f"Master empirical PSF created from median stack of {len(psf_cutouts)} normalized cutouts ({cutout_size}×{cutout_size}).")
+else:
+    master_psf = np.zeros((cutout_size, cutout_size))
+    print("No cutouts available for master PSF.")
+
+# Display the master PSF
+plt.figure(figsize=(8, 8))
+plt.imshow(master_psf, cmap='viridis', origin='lower', vmin=0)
+plt.title('Master Empirical PSF\n(Median stack of normalized 41×41 cutouts)')
+plt.colorbar(label='Normalized flux')
+plt.tight_layout()
+plt.show()
+
+# Save master PSF
+master_psf_path = os.path.join(os.getcwd(), "master_psf.npy")
+np.save(master_psf_path, master_psf)
+print(f"Master PSF saved to {master_psf_path}")
+
+# Initial candidates for transients
 print("\nFinding initial candidate pixels exceeding threshold...")
 y_indices, x_indices = np.where(abs_smoothed_sum > threshold)
 candidates = list(zip(x_indices, y_indices))
@@ -179,17 +239,7 @@ values = abs_smoothed_sum[y_indices, x_indices].tolist()
 
 print(f"Found {len(candidates)} initial candidate pixels")
 
-# Print first 20 initial candidates
-if len(candidates) > 0:
-    print("First 20 initial candidates (x, y) with values:")
-    for i in range(min(20, len(candidates))):
-        x, y = candidates[i]
-        val = values[i]
-        print(f"  {i + 1:2d}: ({x}, {y}) value = {val:.1f}")
-else:
-    print("No initial candidates found.")
-
-# Edge culling: eliminate candidates within 50 pixels of image edges
+# Edge culling
 print("\nEdge culling: eliminating candidates within 50 pixels of image edges...")
 ny, nx = abs_smoothed_sum.shape
 edge_margin_candidates = 50
@@ -206,7 +256,7 @@ values = [val for _, val in edge_culled]
 
 print(f"After edge culling: {len(candidates)} candidates remain")
 
-# Adjacency culling: keep only the brightest within 5 pixels
+# Adjacency culling
 print("\nAdjacency culling: keeping brightest within 5 pixels...")
 culled_candidates = []
 
@@ -228,11 +278,11 @@ candidates = culled_candidates
 
 print(f"After adjacency culling: {len(candidates)} unique bright candidates remain")
 
-# 3×3 boxcar sum-smoothed template
+# 3×3 boxcar sum-smoothed template for Poisson culling
 print("\nCreating 3×3 boxcar sum-smoothed template image...")
 smoothed_template = uniform_filter(template_img, size=3) * 9
 
-# Secondary culling using Poisson noise estimate
+# Secondary Poisson culling
 poisson_multiplier = 5
 print(f"\nSecondary culling with poisson_multiplier = {poisson_multiplier}")
 
@@ -248,31 +298,76 @@ for x, y in candidates:
 candidates = final_candidates
 
 print(f"After secondary Poisson culling: {len(candidates)} candidates remain")
+
+# Fit each final candidate to master PSF + local background over 5x5 region
+print("\nFitting final candidates to master PSF + local background (5x5 region)...")
+
+# Crop master PSF to central 5x5 for fitting
+psf_fit_size = 5
+psf_half = psf_fit_size // 2
+master_psf_central = master_psf[half_cut - psf_half:half_cut + psf_half + 1,
+                     half_cut - psf_half:half_cut + psf_half + 1]
+
+# Flatten for fitting
+psf_vec = master_psf_central.flatten()
+psf_sum = np.sum(psf_vec)  # For flux calculation
+
+fit_results = []
+for i, (x, y) in enumerate(candidates):
+    # Extract 5x5 cutout from rescaled science image
+    x0 = int(x - psf_half)
+    x1 = int(x + psf_half + 1)
+    y0 = int(y - psf_half)
+    y1 = int(y + psf_half + 1)
+
+    cutout = rescaled_science_img[y0:y1, x0:x1]
+    data_vec = cutout.flatten()
+
+    # Design matrix: PSF vector and constant for background
+    design = np.vstack([psf_vec, np.ones(psf_fit_size ** 2)]).T
+
+    # Least squares fit
+    params, residuals, rank, s = np.linalg.lstsq(design, data_vec, rcond=None)
+    amplitude, background = params
+
+    # Total flux
+    flux = amplitude * psf_sum
+
+    # Chi-squared
+    model = amplitude * psf_vec + background
+    chi2 = np.sum((data_vec - model) ** 2)
+    dof = psf_fit_size ** 2 - 2
+    chi2_dof = chi2 / dof if dof > 0 else np.nan
+
+    fit_results.append((flux, background, chi2_dof))
+
+# Tertiary culling: remove candidates with chi2/dof > 10
+print("\nTertiary culling: eliminating candidates with chi²/dof > 10...")
+good_fit_candidates = []
+good_fit_results = []
+
+for i in range(len(candidates)):
+    chi2_dof = fit_results[i][2]
+    if chi2_dof <= 10.0:
+        good_fit_candidates.append(candidates[i])
+        good_fit_results.append(fit_results[i])
+
+candidates = good_fit_candidates
+fit_results = good_fit_results
+
+print(f"After chi²/dof culling: {len(candidates)} candidates remain")
+
+# Print revised table with fit parameters
 if len(candidates) > 0:
-    print("First 20 final candidates (x, y) with values:")
-    for i in range(min(20, len(candidates))):
+    print("Revised final candidates with PSF fit parameters (5x5 region):")
+    print("  #    (x, y)      residual    flux       background   chi2/dof")
+    for i in range(len(candidates)):
         x, y = candidates[i]
-        val = abs_smoothed_sum[y, x]
-        print(f"  {i + 1:2d}: ({x}, {y}) value = {val:.1f}")
+        residual = abs_smoothed_sum[y, x]
+        flux, bg, chi2_dof = fit_results[i]
+        print(f"  {i + 1:2d}: ({x:4d}, {y:4d})  {residual:8.1f}  {flux:8.1f}  {bg:8.1f}  {chi2_dof:6.2f}")
 else:
-    print("No candidates remain after secondary culling.")
-
-# Characterize PSF in the median template image using a clean subset of stars
-print("\nCharacterizing PSF in the median template image...")
-template_psf_data = find_star_centroids_and_fwhms(template_img, num_stars=50)
-
-if len(template_psf_data) == 0:
-    print("No suitable stars found for PSF characterization in template.")
-else:
-    fwhms = [fwhm for _, _, fwhm, _ in template_psf_data]
-    median_fwhm = np.median(fwhms)
-    mean_fwhm = np.mean(fwhms)
-    std_fwhm = np.std(fwhms)
-    print(f"PSF characterization using {len(template_psf_data)} isolated, non-saturated stars:")
-    print(f"  Median FWHM: {median_fwhm:.2f} pixels")
-    print(f"  Mean FWHM: {mean_fwhm:.2f} pixels (± {std_fwhm:.2f} pixels)")
-    print("  The PSF is modeled as the distribution of 2D Gaussian FWHM fits to these stars.")
-    print("  Individual star FWHM values are stored in template_psf_data for potential further analysis.")
+    print("No candidates remain after chi²/dof culling.")
 
 # Display FULL rescaled science image with red circles (diameter 20 px) around final candidates
 print("\nDisplaying FULL rescaled science image with red circles (diameter 20 px) on all final candidates...")
