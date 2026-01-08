@@ -22,6 +22,7 @@ saturation_threshold = 60000.0  # Dismiss stars with peak > this value (likely s
 duplicate_distance_threshold = 3.0  # Pixels; skip if centroid within this distance of existing
 aperture_radius = 5.0  # Radius for aperture checks
 aperture_max_threshold = 10000.0  # Dismiss stars if any pixel in aperture > this value
+edge_margin = 200  # Exclude stars within this many pixels of image edges
 
 
 ###############################################################################
@@ -47,11 +48,15 @@ aperture_max_threshold = 10000.0  # Dismiss stars if any pixel in aperture > thi
 #        with proper calibration but can appear due to over-subtraction) are
 #        replaced with 32768.0 — the conventional "zero" level for unsigned 16-bit
 #        data (corresponding to BZERO in FITS headers).
+#     4. Subtract the whole-image median to create background-subtracted data.
+#        This is used for all subsequent processing (star detection, alignment,
+#        template creation, photometry, differences).
 #
 # Benefits:
 # - Large UINT16 values (e.g., >32767) will never become negative.
-# - All subsequent operations (subtraction, median, shifts) are performed in
-#   floating point with full precision.
+# - Background is normalized to ~0 in each frame.
+# - All subsequent operations are performed on background-subtracted data with
+#   full floating-point precision.
 #
 # Potential sources of artifacts:
 # - If calibration produced negative values that were clipped to zero, or if
@@ -83,14 +88,21 @@ def load_matching_fits_images(dir_path, file_prefix, file_suffix):
                 raise ValueError(f"No image data in primary HDU of {filepath}")
             # Convert to float32 to preserve exact values and enable safe arithmetic
             float_data = np.array(data, dtype=np.float32)
-            # Replace any negative values (from over-subtraction) with 32768.0 (UINT16 zero level)
+            # Fix any negative values (from over-subtraction) to 32768.0 (UINT16 zero level)
             float_data[float_data < 0] = 32768.0
+            # Compute and report whole-image median background
+            background = np.median(float_data)
+            print(f"  Background (median) for {os.path.basename(filepath)}: {background:.1f} counts")
+            # Subtract background - all further processing uses background-subtracted data
+            float_data -= background
             image_arrays.append(float_data)
 
     return image_arrays, matching_files
 
 
 def find_star_centroids_and_fwhms(image_data, num_stars=20):
+    # Note: image_data is already background-subtracted from loader
+    # The additional subtraction here is redundant but harmless (median ~0)
     background = np.median(image_data)
     data_sub = image_data - background
 
@@ -114,6 +126,9 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
 
     # Pre-compute coordinate grids for aperture checks
     y_grid, x_grid = np.indices(image_data.shape)
+
+    # Image dimensions for edge filtering
+    ny, nx = image_data.shape
 
     for i in range(min(len(sorted_peaks_y), num_stars * 5)):  # Try more to fill after filtering
         y = sorted_peaks_y[i]
@@ -144,6 +159,7 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
                 fwhm_mean = np.mean([g_fit.x_stddev.value * 2.355, g_fit.y_stddev.value * 2.355])
                 full_x = x0 + g_fit.x_mean.value
                 full_y = y0 + g_fit.y_mean.value
+                # Peak pixel in background-subtracted image (net above background)
                 peak_pixel = image_data[int(np.round(full_y)), int(np.round(full_x))]
 
                 # Dismiss saturated stars (peak pixel)
@@ -154,6 +170,11 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
                 dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
                 aperture_mask = dist_sq <= aperture_radius ** 2
                 if np.max(image_data[aperture_mask]) > aperture_max_threshold:
+                    continue
+
+                # Eliminate stars within 200 pixels of image edges
+                if (full_x < edge_margin or full_x > nx - edge_margin or
+                        full_y < edge_margin or full_y > ny - edge_margin):
                     continue
 
                 # De-duplicate: check distance to existing centroids
@@ -176,7 +197,7 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
             break
 
     if len(star_data) < num_stars:
-        print(f"Warning: Only found {len(star_data)} unique non-saturated star fits (requested {num_stars}).")
+        print(f"Warning: Only found {len(star_data)} unique non-saturated non-edge star fits (requested {num_stars}).")
 
     return star_data
 
@@ -188,7 +209,7 @@ def estimate_fwhm(star_data):
     return np.median(fwhms)
 
 
-# Uses stars from the entire image
+# Uses stars from the entire image (no central restriction for zoom star)
 def find_suitable_bright_star(star_data, image_shape):
     if len(star_data) < 2:
         raise ValueError("Fewer than 2 stars found in the image.")
@@ -250,16 +271,16 @@ def align_images(template, target, template_star_data, num_stars=20):
 
     # ==============================================================================
     # KEY STEP: Sub-pixel image displacement via interpolation
-    # 
+    #
     # The following line performs the actual alignment of the target image to the
     # template by shifting it by the computed (sub-pixel) offsets.
-    # 
+    #
     # - shift() from scipy.ndimage uses spline interpolation.
     # - order=5 specifies 5th-order (quintic) spline interpolation for high accuracy.
     # - mode='constant' fills areas outside the original image with a constant value.
     # - cval=np.median(target) uses the median of the target image as the fill value
     #   to avoid introducing bright or dark edges.
-    # 
+    #
     # This interpolation allows precise sub-pixel shifts without resampling artifacts
     #   that would degrade the subtraction quality.
     # ==============================================================================
@@ -317,18 +338,6 @@ if __name__ == "__main__":
         template_base = first_images[0]
         template_star_data = find_star_centroids_and_fwhms(template_base, num_stars_for_alignment)
 
-        # NEW: Eliminate stars within 200 pixels of image edges
-        ny, nx = template_base.shape
-        edge_margin = 200
-        filtered_star_data = []
-        for full_x, full_y, fwhm, peak in template_star_data:
-            if (full_x >= edge_margin and full_x <= nx - edge_margin and
-                    full_y >= edge_margin and full_y <= ny - edge_margin):
-                filtered_star_data.append((full_x, full_y, fwhm, peak))
-
-        template_star_data = filtered_star_data
-        print(f"After edge filtering: {len(template_star_data)} stars remain for alignment and photometry.")
-
         aligned_first_images = [template_base]  # First image is already aligned to itself
         for img in first_images[1:]:
             aligned_img, _ = align_images(template_base, img, template_star_data, num_stars_for_alignment)
@@ -336,6 +345,11 @@ if __name__ == "__main__":
 
         template_img = np.median(aligned_first_images, axis=0)
         print("Median template created.")
+
+        # Compute and print final template background (should be near 0)
+        template_final_background = np.median(template_img)
+        print(
+            f"  Median template final background (after subtraction and combination): {template_final_background:.1f} counts (expected near 0)")
 
         # Display central 1000×1000 of the template
         ny, nx = template_img.shape
@@ -406,7 +420,7 @@ if __name__ == "__main__":
         print("\nSelecting a different bright star for zoom...")
         center_y, center_x, template_star_peak = find_suitable_bright_star(template_star_data, template_img.shape)
         print(f"Selected star at (x, y) = ({center_x:.2f}, {center_y:.2f})")
-        print(f"Maximum value at the peak pixel of this template star: {template_star_peak:.1f} counts")
+        print(f"Net peak value above background of this template star: {template_star_peak:.1f} counts")
         zoom_half_size = int(5 * fwhm_pixels)
 
         # Compute differences
@@ -418,7 +432,7 @@ if __name__ == "__main__":
 
         aligned_diff = template_img - aligned_target
 
-        # NEW: Aperture photometry table for the stars (now edge-filtered)
+        # Aperture photometry table for the stars
         print("\nComputing aperture photometry for the alignment stars...")
         photometry_data = []
         y_grid, x_grid = np.indices(template_img.shape)
@@ -434,28 +448,72 @@ if __name__ == "__main__":
                 'Star': i + 1,
                 'X': round(full_x, 2),
                 'Y': round(full_y, 2),
-                'Template Counts': round(template_sum),
-                'Science Counts': round(science_sum)
+                'Template Net Counts': round(template_sum),
+                'Science Net Counts': round(science_sum)
             })
 
         df_phot = pd.DataFrame(photometry_data)
         print("\n" + "=" * 80)
-        print("APERTURE PHOTOMETRY TABLE (5-pixel radius)")
+        print("APERTURE PHOTOMETRY TABLE (5-pixel radius, net above background)")
         print("=" * 80)
         print(df_phot.to_string(index=False))
         print("=" * 80)
 
-        print(f"\nAverage template counts: {np.mean(df_phot['Template Counts']):.0f}")
-        print(f"Average science counts (aligned): {np.mean(df_phot['Science Counts']):.0f}")
+        # Photometric scaling of the science image to match template
+        avg_template = np.mean(df_phot['Template Net Counts'])
+        avg_science = np.mean(df_phot['Science Net Counts'])
+        if avg_template == 0:
+            print("Warning: Average template counts is zero - cannot scale.")
+            scale_ratio = 1.0
+        else:
+            scale_ratio = avg_science / avg_template
+        print(f"\nAverage template net counts: {avg_template:.0f}")
+        print(f"Average science net counts (aligned): {avg_science:.0f}")
+        print(f"Photometric scale ratio (science / template): {scale_ratio:.4f}")
+
+        # Scale the aligned science image to match template flux
+        scaled_aligned_target = aligned_target / scale_ratio
+
+        # Recompute photometry on the rescaled science image
+        print("\nRecomputing photometry on the rescaled science image...")
+        for row in photometry_data:
+            full_x = row['X']
+            full_y = row['Y']
+            dist_sq = (x_grid - full_x) ** 2 + (y_grid - full_y) ** 2
+            aperture_mask = dist_sq <= aperture_radius ** 2
+            rescaled_sum = np.sum(scaled_aligned_target[aperture_mask])
+            row['Rescaled Science Net Counts'] = round(rescaled_sum)
+
+        df_phot = pd.DataFrame(photometry_data)
+        print("\n" + "=" * 100)
+        print("APERTURE PHOTOMETRY TABLE WITH RESCALED SCIENCE VALUES (5-pixel radius, net above background)")
+        print("=" * 100)
+        print(df_phot.to_string(index=False))
+        print("=" * 100)
+
+        avg_rescaled = np.mean(df_phot['Rescaled Science Net Counts'])
+        print(f"\nAverage rescaled science net counts: {avg_rescaled:.0f}")
+
+        # Recompute the final difference with scaled science image
+        scaled_aligned_diff = template_img - scaled_aligned_target
+
+        # Local min/max now on the scaled difference
+        local_diff_patch = extract_local_patch(scaled_aligned_diff, center_y, center_x, radius=5)
+        local_diff_min = np.min(local_diff_patch)
+        local_diff_max = np.max(local_diff_patch)
+
+        # Save the scaled difference as the final result
+        scaled_aligned_output_path = os.path.join(cwd, "scaled_aligned_template_last_difference.fits")
+        fits.PrimaryHDU(scaled_aligned_diff).writeto(scaled_aligned_output_path, overwrite=True)
+
+        print(f"\nScaled aligned difference saved to: {scaled_aligned_output_path}")
+
+        # Update aligned_diff for display
+        aligned_diff = scaled_aligned_diff
 
         # Local max in template star (original image)
         local_template_patch = extract_local_patch(template_img, center_y, center_x, radius=5)
         local_template_max = np.max(local_template_patch)
-
-        # Local min/max in aligned difference around the same star
-        local_diff_patch = extract_local_patch(aligned_diff, center_y, center_x, radius=5)
-        local_diff_min = np.min(local_diff_patch)
-        local_diff_max = np.max(local_diff_patch)
 
         # Save differences
         unaligned_output_path = os.path.join(cwd, "unaligned_template_last_difference.fits")
@@ -469,7 +527,7 @@ if __name__ == "__main__":
 
         print("\nUnaligned difference (global):")
         print(f"  Mean: {np.mean(unaligned_diff):.4f}   Std: {np.std(unaligned_diff):.4f}")
-        print("\nAligned difference (final result):")
+        print("\nScaled aligned difference (final result):")
         print(f"  Global mean: {np.mean(aligned_diff):.4f}   Global std: {np.std(aligned_diff):.4f}")
         print(
             f"  Local (within 5 px of template star at ({center_x:.1f}, {center_y:.1f})) minimum: {local_diff_min:.1f}")
@@ -480,7 +538,7 @@ if __name__ == "__main__":
         print(f"\nImages saved to:")
         print(f"  Median template: {template_output_path}")
         print(f"  Unaligned difference: {unaligned_output_path}")
-        print(f"  Aligned difference: {aligned_output_path}")
+        print(f"  Scaled aligned difference: {scaled_aligned_output_path}")
 
         # Centroid table
         print("\n" + "=" * 100)
@@ -513,7 +571,7 @@ if __name__ == "__main__":
         im1 = axs[1].imshow(aligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(aligned_diff) * 3, vmax=np.std(aligned_diff) * 3,
                             extent=rel_extent)
-        axs[1].set_title(f'Aligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
+        axs[1].set_title(f'Scaled Aligned Difference (template − last)\nMedian template − {os.path.basename(file2)}\n'
                          f'Alignment target: ±{target_alignment_accuracy:.2f} px | Center: ({center_x:.1f}, {center_y:.1f})')
         axs[1].set_xlabel('ΔX from center (pixels)')
         axs[1].set_xlim(-15, 15)
