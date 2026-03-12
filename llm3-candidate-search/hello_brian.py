@@ -5,6 +5,9 @@ from matplotlib.patches import Circle
 from scipy.ndimage import maximum_filter, shift, uniform_filter
 from astropy.modeling import models, fitting
 
+# Clear all previous figures so only current run's plots are visible
+plt.close('all')
+
 # Corrected directory containing the NumPy files (relative path)
 data_dir = "../llm-2-photometric-rescaling"
 
@@ -29,6 +32,34 @@ print(f"Rescaled science image loaded: shape {rescaled_science_img.shape}, dtype
 # Basic statistics
 print("\nTemplate image statistics:")
 print(f"  Min: {np.min(template_img):.1f}, Max: {np.max(template_img):.1f}, Mean: {np.mean(template_img):.1f}")
+
+# ────────────────────────────────────────────────
+# Find and report the single brightest pixel in the template
+# (used for direct 100-pixel exclusion of candidates)
+# ────────────────────────────────────────────────
+print("\nSearching for the brightest pixel in the median template image...")
+
+if template_img.size == 0:
+    print("  Template image is empty — cannot find brightest pixel.")
+    x_max = y_max = None
+else:
+    max_value = np.max(template_img)
+    max_coords = np.unravel_index(np.argmax(template_img), template_img.shape)
+    y_max, x_max = max_coords  # numpy: (row=y, column=x)
+
+    print(f"  Brightest pixel value: {max_value:.1f} counts")
+    print(f"  Location (x, y): ({x_max}, {y_max})")
+    print(f"  Location (y, x — numpy order): ({y_max}, {x_max})")
+
+    # Show small neighborhood for context
+    half = 2
+    y0 = max(0, y_max - half)
+    y1 = min(template_img.shape[0], y_max + half + 1)
+    x0 = max(0, x_max - half)
+    x1 = min(template_img.shape[1], x_max + half + 1)
+
+    print(f"  5×5 neighborhood around brightest pixel (values):")
+    print(template_img[y0:y1, x0:x1])
 
 print("\nRescaled science image statistics:")
 print(
@@ -69,6 +100,7 @@ aperture_radius = 5.0
 aperture_max_threshold = 10000.0
 edge_margin = 200
 duplicate_distance_threshold = 3.0
+bright_star_exclusion_radius = 100.0
 
 
 # Function to find star centroids and FWHM
@@ -175,8 +207,6 @@ else:
     print(f"PSF characterization using {len(template_psf_data)} isolated, non-saturated stars:")
     print(f"  Median FWHM: {median_fwhm:.2f} pixels")
     print(f"  Mean FWHM: {mean_fwhm:.2f} pixels (± {std_fwhm:.2f} pixels)")
-    print("  The PSF is modeled as the distribution of 2D Gaussian FWHM fits to these stars.")
-    print("  Individual star FWHM values are stored in template_psf_data for potential further analysis.")
 
 # Create master empirical PSF by stacking cutouts from PSF stars
 print("\nCreating master empirical PSF by stacking cutouts from PSF stars...")
@@ -224,7 +254,7 @@ plt.imshow(master_psf, cmap='viridis', origin='lower', vmin=0)
 plt.title('Master Empirical PSF\n(Median stack of normalized 41×41 cutouts)')
 plt.colorbar(label='Normalized flux')
 plt.tight_layout()
-plt.show()
+plt.show(block=False)
 
 # Save master PSF
 master_psf_path = os.path.join(os.getcwd(), "master_psf.npy")
@@ -277,6 +307,31 @@ for i, (x, y) in enumerate(sorted_candidates):
 candidates = culled_candidates
 
 print(f"After adjacency culling: {len(candidates)} unique bright candidates remain")
+
+# ──────────────────────────────────────────────────────────────
+# Exclude candidates within 100 pixels of the brightest pixel
+# ──────────────────────────────────────────────────────────────
+print(
+    f"\nExcluding candidates within {bright_star_exclusion_radius} pixels of the brightest pixel ({x_max}, {y_max})...")
+
+if x_max is None or y_max is None:
+    print("  Brightest pixel not found → no exclusion applied.")
+    excluded_count = 0
+else:
+    kept_candidates = []
+    excluded_count = 0
+
+    for x, y in candidates:
+        dist = np.sqrt((x - x_max) ** 2 + (y - y_max) ** 2)
+        if dist <= bright_star_exclusion_radius:
+            excluded_count += 1
+        else:
+            kept_candidates.append((x, y))
+
+    candidates = kept_candidates
+
+print(f"  Removed {excluded_count} candidates within {bright_star_exclusion_radius} pixels of brightest pixel.")
+print(f"  Remaining candidates: {len(candidates)}")
 
 # 3×3 boxcar sum-smoothed template for Poisson culling
 print("\nCreating 3×3 boxcar sum-smoothed template image...")
@@ -348,7 +403,7 @@ for i, (x, y) in enumerate(candidates):
 
     fit_results.append((flux, background, chi2_dof))
 
-# Tertiary culling: remove candidates with chi2/dof > 30
+# Tertiary culling: remove candidates with chi2/dof > 30 (changed back to 30.0)
 print("\nTertiary culling: eliminating candidates with chi²/dof > 30...")
 good_fit_candidates = []
 good_fit_results = []
@@ -377,18 +432,19 @@ else:
     print("No candidates remain after chi²/dof culling.")
 
 # ────────────────────────────────────────────────
-# Display 20×20 postage stamps for each final candidate
+# Display 30×30 postage stamps for each final candidate
 # ────────────────────────────────────────────────
-print("\nGenerating 20×20 postage stamps around final candidates (from rescaled science image)...")
+print("\nGenerating 30×30 postage stamps around final candidates (from rescaled science image)...")
 
-stamp_size = 20
+stamp_size = 30
 half_stamp = stamp_size // 2
 
 for i, (x, y) in enumerate(candidates):
+    plt.figure(figsize=(6, 6))
+
     x_c = int(np.round(x))
     y_c = int(np.round(y))
 
-    # Boundary-safe slicing
     y0 = max(0, y_c - half_stamp)
     y1 = min(rescaled_science_img.shape[0], y_c + half_stamp + 1)
     x0 = max(0, x_c - half_stamp)
@@ -396,53 +452,48 @@ for i, (x, y) in enumerate(candidates):
 
     cutout = rescaled_science_img[y0:y1, x0:x1]
 
-    # Create figure
-    fig, ax = plt.subplots(figsize=(5.5, 5.5))
-    im = ax.imshow(cutout, cmap='gray', origin='lower',
-                   vmin=np.percentile(rescaled_science_img, 1),
-                   vmax=np.percentile(rescaled_science_img, 99))
+    plt.imshow(cutout, cmap='gray', origin='lower',
+               vmin=np.percentile(rescaled_science_img, 1),
+               vmax=np.percentile(rescaled_science_img, 99))
 
-    # Mark the exact fitted position (red +)
-    ax.plot(x - x0 + 0.5, y - y0 + 0.5, marker='+', color='red',
-            markersize=14, markeredgewidth=2, label='Candidate position')
+    plt.plot(x - x0 + 0.5, y - y0 + 0.5, marker='+', color='red',
+             markersize=16, markeredgewidth=2.5, label='Candidate position')
 
     flux_val, bg_val, chi2dof_val = fit_results[i]
-    ax.set_title(f"Candidate {i + 1}   ({x:.1f}, {y:.1f})\n"
-                 f"flux = {flux_val:.1f}    χ²/dof = {chi2dof_val:.2f}")
-    ax.set_xlabel("pixel offset")
-    ax.set_ylabel("pixel offset")
-    ax.legend(loc='upper right', fontsize=9)
-
-    fig.colorbar(im, ax=ax, shrink=0.78, label="counts")
+    plt.title(f"Candidate {i + 1}   ({x:.1f}, {y:.1f})\n"
+              f"flux = {flux_val:.1f}    χ²/dof = {chi2dof_val:.2f}")
+    plt.xlabel("pixel offset")
+    plt.ylabel("pixel offset")
+    plt.legend(loc='upper right', fontsize=10)
+    plt.colorbar(shrink=0.78, label="counts")
     plt.tight_layout()
-    plt.show()
+    plt.show(block=False)
 
     print(f"  Displayed stamp {i + 1}/{len(candidates)} at ({x:.1f}, {y:.1f})")
 
-print(f"All {len(candidates)} final candidates shown as individual 20×20 stamps.")
+print(f"All {len(candidates)} final candidates shown as individual 30×30 stamps.")
 
 # Display FULL rescaled science image with red circles (diameter 20 px) around final candidates
 print("\nDisplaying FULL rescaled science image with red circles (diameter 20 px) on all final candidates...")
-fig_science_full, ax_science_full = plt.subplots(1, 1, figsize=(20, 20))
-im_science_full = ax_science_full.imshow(rescaled_science_img, cmap='gray', origin='lower',
-                                         vmin=np.percentile(rescaled_science_img, 1),
-                                         vmax=np.percentile(rescaled_science_img, 99))
+plt.figure(figsize=(20, 20))
+plt.imshow(rescaled_science_img, cmap='gray', origin='lower',
+           vmin=np.percentile(rescaled_science_img, 1),
+           vmax=np.percentile(rescaled_science_img, 99))
 
 for x, y in candidates:
     circ = Circle((x, y), radius=10, fill=False, color='red', linewidth=2)
-    ax_science_full.add_patch(circ)
+    plt.gca().add_patch(circ)
 
-ax_science_full.set_title(
+plt.title(
     f'Full Rescaled Aligned Science Image\nRed circles (diameter 20 px) on all {len(candidates)} final candidates')
-ax_science_full.set_xlabel('X pixel')
-ax_science_full.set_ylabel('Y pixel')
-fig_science_full.colorbar(im_science_full, ax=ax_science_full, shrink=0.8, label='Counts')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(shrink=0.8, label='Counts')
 plt.tight_layout()
-plt.show()
+plt.show(block=False)
 
 print(f"All {len(candidates)} final candidates are marked on the full image.")
 
-# (The rest of your original plotting code — central regions, zooms, histogram — remains unchanged)
 # Pre-compute central 2000×2000 regions for other displays
 half_large = 1000
 ny, nx = template_img.shape
@@ -458,88 +509,94 @@ abs_diff_central_large = abs_difference[center_y_large - half_large:center_y_lar
                          center_x_large - half_large:center_x_large + half_large]
 
 # 2×2 grid layout for large central regions
-fig_large, axs_large = plt.subplots(2, 2, figsize=(24, 24))
+plt.figure(figsize=(24, 24))
 
 # Template (top-left)
-im0 = axs_large[0, 0].imshow(template_central_large, cmap='gray', origin='lower',
-                             vmin=np.percentile(template_central_large, 1),
-                             vmax=np.percentile(template_central_large, 99))
-axs_large[0, 0].set_title('Central 2000×2000 of Median Template')
-axs_large[0, 0].set_xlabel('X pixel')
-axs_large[0, 0].set_ylabel('Y pixel')
-fig_large.colorbar(im0, ax=axs_large[0, 0], shrink=0.8)
+plt.subplot(2, 2, 1)
+plt.imshow(template_central_large, cmap='gray', origin='lower',
+           vmin=np.percentile(template_central_large, 1),
+           vmax=np.percentile(template_central_large, 99))
+plt.title('Central 2000×2000 of Median Template')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(shrink=0.8)
 
 # Rescaled science (top-right)
-im1 = axs_large[0, 1].imshow(science_central_large, cmap='gray', origin='lower',
-                             vmin=np.percentile(science_central_large, 1),
-                             vmax=np.percentile(science_central_large, 99))
-axs_large[0, 1].set_title('Central 2000×2000 of Rescaled Aligned Science Image')
-axs_large[0, 1].set_xlabel('X pixel')
-axs_large[0, 1].set_ylabel('Y pixel')
-fig_large.colorbar(im1, ax=axs_large[0, 1], shrink=0.8)
+plt.subplot(2, 2, 2)
+plt.imshow(science_central_large, cmap='gray', origin='lower',
+           vmin=np.percentile(science_central_large, 1),
+           vmax=np.percentile(science_central_large, 99))
+plt.title('Central 2000×2000 of Rescaled Aligned Science Image')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(shrink=0.8)
 
 # Difference (bottom-left)
 vmax = np.std(diff_central_large) * 3
-im2 = axs_large[1, 0].imshow(diff_central_large, cmap='RdBu', origin='lower',
-                             vmin=-vmax, vmax=vmax)
-axs_large[1, 0].set_title('Central 2000×2000 Difference\n(Rescaled Science − Template)')
-axs_large[1, 0].set_xlabel('X pixel')
-axs_large[1, 0].set_ylabel('Y pixel')
-fig_large.colorbar(im2, ax=axs_large[1, 0], label='Difference (counts)', shrink=0.8)
+plt.subplot(2, 2, 3)
+plt.imshow(diff_central_large, cmap='RdBu', origin='lower',
+           vmin=-vmax, vmax=vmax)
+plt.title('Central 2000×2000 Difference\n(Rescaled Science − Template)')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(label='Difference (counts)', shrink=0.8)
 
 # Absolute difference (bottom-right)
 vmax_abs = np.percentile(abs_diff_central_large, 99.5)
-im3 = axs_large[1, 1].imshow(abs_diff_central_large, cmap='viridis', origin='lower',
-                             vmin=0, vmax=vmax_abs)
-axs_large[1, 1].set_title(f'Central 2000×2000 Absolute Difference\nMedian: {abs_median:.1f} counts')
-axs_large[1, 1].set_xlabel('X pixel')
-axs_large[1, 1].set_ylabel('Y pixel')
-fig_large.colorbar(im3, ax=axs_large[1, 1], label='Absolute Difference (counts)', shrink=0.8)
+plt.subplot(2, 2, 4)
+plt.imshow(abs_diff_central_large, cmap='viridis', origin='lower',
+           vmin=0, vmax=vmax_abs)
+plt.title(f'Central 2000×2000 Absolute Difference\nMedian: {abs_median:.1f} counts')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(label='Absolute Difference (counts)', shrink=0.8)
 
 plt.tight_layout()
-plt.show()
+plt.show(block=False)
 
 # 100×100 zooms of the two difference images centered on (x=1699, y=2154)
+print("\nDisplaying 100×100 zoom around (1699, 2154)...")
 zoom_center_x = 1699
 zoom_center_y = 2154
-zoom_half = 50  # For 100×100 region
+zoom_half = 50
 
-# Extract zoomed regions
 diff_zoom = difference[zoom_center_y - zoom_half:zoom_center_y + zoom_half,
             zoom_center_x - zoom_half:zoom_center_x + zoom_half]
 abs_diff_zoom = abs_difference[zoom_center_y - zoom_half:zoom_center_y + zoom_half,
                 zoom_center_x - zoom_half:zoom_center_x + zoom_half]
 
-# 1×2 figure for zoomed differences
-fig_zoom, axs_zoom = plt.subplots(1, 2, figsize=(24, 12))
+plt.figure(figsize=(24, 12))
 
 # Difference zoom
 vmax_zoom = np.std(diff_zoom) * 3
-im_zoom0 = axs_zoom[0].imshow(diff_zoom, cmap='RdBu', origin='lower',
-                              vmin=-vmax_zoom, vmax=vmax_zoom)
-axs_zoom[0].set_title(f'100×100 Zoom of Difference\nCentered at ({zoom_center_x}, {zoom_center_y})')
-axs_zoom[0].set_xlabel('X pixel')
-axs_zoom[0].set_ylabel('Y pixel')
-fig_zoom.colorbar(im_zoom0, ax=axs_zoom[0], label='Difference (counts)', shrink=0.8)
+plt.subplot(1, 2, 1)
+plt.imshow(diff_zoom, cmap='RdBu', origin='lower',
+           vmin=-vmax_zoom, vmax=vmax_zoom)
+plt.title(f'100×100 Zoom of Difference\nCentered at ({zoom_center_x}, {zoom_center_y})')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(label='Difference (counts)', shrink=0.8)
 
 # Absolute difference zoom
 vmax_abs_zoom = np.percentile(abs_diff_zoom, 99.5)
-im_zoom1 = axs_zoom[1].imshow(abs_diff_zoom, cmap='viridis', origin='lower',
-                              vmin=0, vmax=vmax_abs_zoom)
-axs_zoom[1].set_title(
-    f'100×100 Zoom of Absolute Difference\nCentered at ({zoom_center_x}, {zoom_center_y})\nMedian (whole image): {abs_median:.1f} counts')
-axs_zoom[1].set_xlabel('X pixel')
-axs_zoom[1].set_ylabel('Y pixel')
-fig_zoom.colorbar(im_zoom1, ax=axs_zoom[1], label='Absolute Difference (counts)', shrink=0.8)
+plt.subplot(1, 2, 2)
+plt.imshow(abs_diff_zoom, cmap='viridis', origin='lower',
+           vmin=0, vmax=vmax_abs_zoom)
+plt.title(
+    f'100×100 Zoom of Absolute Difference\nCentered at ({zoom_center_x}, {zoom_center_y})\n'
+    f'Median (whole image): {abs_median:.1f} counts')
+plt.xlabel('X pixel')
+plt.ylabel('Y pixel')
+plt.colorbar(label='Absolute Difference (counts)', shrink=0.8)
 
 plt.tight_layout()
-plt.show()
+plt.show(block=False)
 
 # Histogram of the absolute difference values (central region) with logarithmic y-axis
 print("\nDisplaying histogram of the absolute difference values (central 2000×2000 region)...")
 plt.figure(figsize=(12, 8))
-hist_values, bins, _ = plt.hist(abs_diff_central_large.flatten(), bins=200, color='skyblue', alpha=0.7,
-                                edgecolor='black')
+plt.hist(abs_diff_central_large.flatten(), bins=200, color='skyblue', alpha=0.7,
+         edgecolor='black')
 plt.yscale('log')  # Logarithmic vertical axis
 plt.axvline(abs_median, color='red', linestyle='--', linewidth=2, label=f'Median: {abs_median:.2f}')
 plt.axvline(np.mean(abs_diff_central_large), color='orange', linestyle=':', linewidth=2,
@@ -550,6 +607,4 @@ plt.ylabel('Number of pixels (log scale)')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.show()
-
-print(f"Absolute difference median (whole image): {abs_median:.1f} counts")
+plt.show()  # last plot can be blocking
