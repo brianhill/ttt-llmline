@@ -376,6 +376,51 @@ if len(candidates) > 0:
 else:
     print("No candidates remain after chi²/dof culling.")
 
+# ────────────────────────────────────────────────
+# Display 20×20 postage stamps for each final candidate
+# ────────────────────────────────────────────────
+print("\nGenerating 20×20 postage stamps around final candidates (from rescaled science image)...")
+
+stamp_size = 20
+half_stamp = stamp_size // 2
+
+for i, (x, y) in enumerate(candidates):
+    x_c = int(np.round(x))
+    y_c = int(np.round(y))
+
+    # Boundary-safe slicing
+    y0 = max(0, y_c - half_stamp)
+    y1 = min(rescaled_science_img.shape[0], y_c + half_stamp + 1)
+    x0 = max(0, x_c - half_stamp)
+    x1 = min(rescaled_science_img.shape[1], x_c + half_stamp + 1)
+
+    cutout = rescaled_science_img[y0:y1, x0:x1]
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    im = ax.imshow(cutout, cmap='gray', origin='lower',
+                   vmin=np.percentile(rescaled_science_img, 1),
+                   vmax=np.percentile(rescaled_science_img, 99))
+
+    # Mark the exact fitted position (red +)
+    ax.plot(x - x0 + 0.5, y - y0 + 0.5, marker='+', color='red',
+            markersize=14, markeredgewidth=2, label='Candidate position')
+
+    flux_val, bg_val, chi2dof_val = fit_results[i]
+    ax.set_title(f"Candidate {i + 1}   ({x:.1f}, {y:.1f})\n"
+                 f"flux = {flux_val:.1f}    χ²/dof = {chi2dof_val:.2f}")
+    ax.set_xlabel("pixel offset")
+    ax.set_ylabel("pixel offset")
+    ax.legend(loc='upper right', fontsize=9)
+
+    fig.colorbar(im, ax=ax, shrink=0.78, label="counts")
+    plt.tight_layout()
+    plt.show()
+
+    print(f"  Displayed stamp {i + 1}/{len(candidates)} at ({x:.1f}, {y:.1f})")
+
+print(f"All {len(candidates)} final candidates shown as individual 20×20 stamps.")
+
 # Display FULL rescaled science image with red circles (diameter 20 px) around final candidates
 print("\nDisplaying FULL rescaled science image with red circles (diameter 20 px) on all final candidates...")
 fig_science_full, ax_science_full = plt.subplots(1, 1, figsize=(20, 20))
@@ -397,6 +442,7 @@ plt.show()
 
 print(f"All {len(candidates)} final candidates are marked on the full image.")
 
+# (The rest of your original plotting code — central regions, zooms, histogram — remains unchanged)
 # Pre-compute central 2000×2000 regions for other displays
 half_large = 1000
 ny, nx = template_img.shape
