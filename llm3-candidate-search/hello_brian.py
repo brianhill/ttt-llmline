@@ -35,7 +35,6 @@ print(f"  Min: {np.min(template_img):.1f}, Max: {np.max(template_img):.1f}, Mean
 
 # ────────────────────────────────────────────────
 # Find and report the single brightest pixel in the template
-# (used for direct 100-pixel exclusion of candidates)
 # ────────────────────────────────────────────────
 print("\nSearching for the brightest pixel in the median template image...")
 
@@ -51,7 +50,6 @@ else:
     print(f"  Location (x, y): ({x_max}, {y_max})")
     print(f"  Location (y, x — numpy order): ({y_max}, {x_max})")
 
-    # Show small neighborhood for context
     half = 2
     y0 = max(0, y_max - half)
     y1 = min(template_img.shape[0], y_max + half + 1)
@@ -64,6 +62,74 @@ else:
 print("\nRescaled science image statistics:")
 print(
     f"  Min: {np.min(rescaled_science_img):.1f}, Max: {np.max(rescaled_science_img):.1f}, Mean: {np.mean(rescaled_science_img):.1f}")
+
+# ────────────────────────────────────────────────
+# INJECT ARTIFICIAL GAUSSIAN SOURCE FOR TESTING
+# ────────────────────────────────────────────────
+print("\nInjecting artificial 2D Gaussian source with total flux = 100 for testing...")
+
+# Make a working copy
+science_with_injection = rescaled_science_img.copy()
+
+# Gaussian parameters
+fwhm = 3.0
+sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))  # ≈ 1.274 pixels
+total_flux = 100.0
+
+# Patch size (odd number)
+patch_size = 11
+half_patch = patch_size // 2
+
+# Grid for the patch (relative coordinates)
+yy, xx = np.mgrid[-half_patch:half_patch + 1, -half_patch:half_patch + 1]
+
+# Normalized 2D Gaussian (integral over all space = 1)
+gauss = np.exp(- (xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+gauss_integral = gauss.sum()  # approximate integral over 11×11
+gauss_normalized = gauss / gauss_integral
+
+# Scale to desired total flux
+gauss_patch = gauss_normalized * total_flux
+
+print(f"  Gaussian patch sum (≈ total flux): {gauss_patch.sum():.2f}")
+
+# Central 2000×2000 region
+ny, nx = template_img.shape
+center_y, center_x = ny // 2, nx // 2
+margin = half_patch + 10  # safety margin
+cy_min = center_y - 1000 + margin
+cy_max = center_y + 1000 - margin
+cx_min = center_x - 1000 + margin
+cx_max = center_x + 1000 - margin
+
+# Random integer position
+np.random.seed()  # remove or set fixed value for reproducibility
+inj_y = np.random.randint(cy_min, cy_max + 1)
+inj_x = np.random.randint(cx_min, cx_max + 1)
+
+print(f"  Injected Gaussian at (x, y) = ({inj_x}, {inj_y})")
+
+# Add the patch to the science image (handle edges)
+y0 = max(0, inj_y - half_patch)
+y1 = min(ny, inj_y + half_patch + 1)
+x0 = max(0, inj_x - half_patch)
+x1 = min(nx, inj_x + half_patch + 1)
+
+patch_y0 = half_patch - (inj_y - y0)
+patch_y1 = patch_y0 + (y1 - y0)
+patch_x0 = half_patch - (inj_x - x0)
+patch_x1 = patch_x0 + (x1 - x0)
+
+science_with_injection[y0:y1, x0:x1] += gauss_patch[patch_y0:patch_y1, patch_x0:patch_x1]
+
+# Replace original science image with injected version
+rescaled_science_img = science_with_injection
+
+print("  Artificial Gaussian source injected successfully.")
+
+# ────────────────────────────────────────────────
+# Continue with the rest of the pipeline unchanged
+# ────────────────────────────────────────────────
 
 # Compute difference: rescaled science - template
 difference = rescaled_science_img - template_img
@@ -244,9 +310,57 @@ if len(psf_cutouts) > 0:
     master_psf = np.median(psf_cutouts, axis=0)
     print(
         f"Master empirical PSF created from median stack of {len(psf_cutouts)} normalized cutouts ({cutout_size}×{cutout_size}).")
+
+    # ────────────────────────────────────────────────
+    # Report FWHM of the master_psf
+    # ────────────────────────────────────────────────
+    print("\nEstimating FWHM of the master empirical PSF...")
+
+    # Use central region of master_psf for fit (e.g. 21×21)
+    psf_center_size = 21
+    psf_half_center = psf_center_size // 2
+    cy = cutout_size // 2
+    cx = cutout_size // 2
+    psf_center = master_psf[cy - psf_half_center:cy + psf_half_center + 1,
+                 cx - psf_half_center:cx + psf_half_center + 1]
+
+    if psf_center.shape[0] < 10 or psf_center.shape[1] < 10:
+        print("  Master PSF too small to estimate FWHM reliably.")
+        master_fwhm = np.nan
+    else:
+        yy, xx = np.mgrid[0:psf_center.shape[0], 0:psf_center.shape[1]]
+        amplitude_init = psf_center.max()
+        x_mean_init = (psf_center.shape[1] - 1) / 2
+        y_mean_init = (psf_center.shape[0] - 1) / 2
+
+        g_init = models.Gaussian2D(amplitude=amplitude_init,
+                                   x_mean=x_mean_init,
+                                   y_mean=y_mean_init,
+                                   x_stddev=1.5,
+                                   y_stddev=1.5)
+
+        fitter = fitting.LevMarLSQFitter()
+        try:
+            g_fit = fitter(g_init, xx, yy, psf_center)
+            if g_fit.x_stddev.value > 0 and g_fit.y_stddev.value > 0:
+                fwhm_x = g_fit.x_stddev.value * 2.355
+                fwhm_y = g_fit.y_stddev.value * 2.355
+                master_fwhm = (fwhm_x + fwhm_y) / 2
+                print(f"  Estimated FWHM of master PSF: {master_fwhm:.2f} pixels")
+                print(f"  (x_stddev = {g_fit.x_stddev.value:.3f}, y_stddev = {g_fit.y_stddev.value:.3f})")
+            else:
+                print("  Gaussian fit failed to produce positive stddev.")
+                master_fwhm = np.nan
+        except Exception as e:
+            print(f"  Gaussian fit failed: {e}")
+            master_fwhm = np.nan
+
+    if np.isnan(master_fwhm):
+        print("  Could not reliably estimate FWHM of master PSF.")
 else:
     master_psf = np.zeros((cutout_size, cutout_size))
     print("No cutouts available for master PSF.")
+    master_fwhm = np.nan
 
 # Display the master PSF
 plt.figure(figsize=(8, 8))
@@ -403,7 +517,7 @@ for i, (x, y) in enumerate(candidates):
 
     fit_results.append((flux, background, chi2_dof))
 
-# Tertiary culling: remove candidates with chi2/dof > 30 (changed back to 30.0)
+# Tertiary culling: remove candidates with chi2/dof > 30
 print("\nTertiary culling: eliminating candidates with chi²/dof > 30...")
 good_fit_candidates = []
 good_fit_results = []
@@ -583,8 +697,7 @@ plt.subplot(1, 2, 2)
 plt.imshow(abs_diff_zoom, cmap='viridis', origin='lower',
            vmin=0, vmax=vmax_abs_zoom)
 plt.title(
-    f'100×100 Zoom of Absolute Difference\nCentered at ({zoom_center_x}, {zoom_center_y})\n'
-    f'Median (whole image): {abs_median:.1f} counts')
+    f'100×100 Zoom of Absolute Difference\nCentered at ({zoom_center_x}, {zoom_center_y})\nMedian (whole image): {abs_median:.1f} counts')
 plt.xlabel('X pixel')
 plt.ylabel('Y pixel')
 plt.colorbar(label='Absolute Difference (counts)', shrink=0.8)
@@ -608,3 +721,5 @@ plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()  # last plot can be blocking
+
+print(f"Absolute difference median (whole image): {abs_median:.1f} counts")
