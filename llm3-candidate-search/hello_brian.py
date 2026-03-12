@@ -72,8 +72,8 @@ print("\nInjecting artificial 2D Gaussian source with total flux = 100 for testi
 science_with_injection = rescaled_science_img.copy()
 
 # Gaussian parameters
-fwhm = 3.0
-sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))  # ≈ 1.274 pixels
+fwhm = 3.3
+sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))  # ≈ 1.699 pixels
 total_flux = 100.0
 
 # Patch size (odd number)
@@ -310,57 +310,9 @@ if len(psf_cutouts) > 0:
     master_psf = np.median(psf_cutouts, axis=0)
     print(
         f"Master empirical PSF created from median stack of {len(psf_cutouts)} normalized cutouts ({cutout_size}×{cutout_size}).")
-
-    # ────────────────────────────────────────────────
-    # Report FWHM of the master_psf
-    # ────────────────────────────────────────────────
-    print("\nEstimating FWHM of the master empirical PSF...")
-
-    # Use central region of master_psf for fit (e.g. 21×21)
-    psf_center_size = 21
-    psf_half_center = psf_center_size // 2
-    cy = cutout_size // 2
-    cx = cutout_size // 2
-    psf_center = master_psf[cy - psf_half_center:cy + psf_half_center + 1,
-                 cx - psf_half_center:cx + psf_half_center + 1]
-
-    if psf_center.shape[0] < 10 or psf_center.shape[1] < 10:
-        print("  Master PSF too small to estimate FWHM reliably.")
-        master_fwhm = np.nan
-    else:
-        yy, xx = np.mgrid[0:psf_center.shape[0], 0:psf_center.shape[1]]
-        amplitude_init = psf_center.max()
-        x_mean_init = (psf_center.shape[1] - 1) / 2
-        y_mean_init = (psf_center.shape[0] - 1) / 2
-
-        g_init = models.Gaussian2D(amplitude=amplitude_init,
-                                   x_mean=x_mean_init,
-                                   y_mean=y_mean_init,
-                                   x_stddev=1.5,
-                                   y_stddev=1.5)
-
-        fitter = fitting.LevMarLSQFitter()
-        try:
-            g_fit = fitter(g_init, xx, yy, psf_center)
-            if g_fit.x_stddev.value > 0 and g_fit.y_stddev.value > 0:
-                fwhm_x = g_fit.x_stddev.value * 2.355
-                fwhm_y = g_fit.y_stddev.value * 2.355
-                master_fwhm = (fwhm_x + fwhm_y) / 2
-                print(f"  Estimated FWHM of master PSF: {master_fwhm:.2f} pixels")
-                print(f"  (x_stddev = {g_fit.x_stddev.value:.3f}, y_stddev = {g_fit.y_stddev.value:.3f})")
-            else:
-                print("  Gaussian fit failed to produce positive stddev.")
-                master_fwhm = np.nan
-        except Exception as e:
-            print(f"  Gaussian fit failed: {e}")
-            master_fwhm = np.nan
-
-    if np.isnan(master_fwhm):
-        print("  Could not reliably estimate FWHM of master PSF.")
 else:
     master_psf = np.zeros((cutout_size, cutout_size))
     print("No cutouts available for master PSF.")
-    master_fwhm = np.nan
 
 # Display the master PSF
 plt.figure(figsize=(8, 8))
@@ -517,14 +469,14 @@ for i, (x, y) in enumerate(candidates):
 
     fit_results.append((flux, background, chi2_dof))
 
-# Tertiary culling: remove candidates with chi2/dof > 30
-print("\nTertiary culling: eliminating candidates with chi²/dof > 30...")
+# Tertiary culling: remove candidates with chi2/dof > 10
+print("\nTertiary culling: eliminating candidates with chi²/dof > 10...")
 good_fit_candidates = []
 good_fit_results = []
 
 for i in range(len(candidates)):
     chi2_dof = fit_results[i][2]
-    if chi2_dof <= 30.0:
+    if chi2_dof <= 10.0:
         good_fit_candidates.append(candidates[i])
         good_fit_results.append(fit_results[i])
 
