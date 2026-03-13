@@ -4,6 +4,11 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
 from scipy.ndimage import maximum_filter, shift, uniform_filter
 from astropy.modeling import models, fitting
+from astropy.io import fits
+from astropy.wcs import WCS
+from astropy.coordinates import SkyCoord
+import astropy.units as u
+import pandas as pd
 
 # Clear all previous figures so only current run's plots are visible
 plt.close('all')
@@ -14,12 +19,12 @@ data_dir = "../llm-2-photometric-rescaling"
 # File paths
 template_path = os.path.join(data_dir, "median_template.npy")
 rescaled_science_path = os.path.join(data_dir, "rescaled_aligned_science.npy")
+template_fits_path = os.path.join(data_dir, "median_template.fits")  # for WCS
 
 # Check if files exist
-if not os.path.exists(template_path):
-    raise FileNotFoundError(f"Template file not found: {template_path}")
-if not os.path.exists(rescaled_science_path):
-    raise FileNotFoundError(f"Rescaled science file not found: {rescaled_science_path}")
+for path in [template_path, rescaled_science_path, template_fits_path]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Required file not found: {path}")
 
 # Load the NumPy arrays
 print("Loading NumPy arrays...")
@@ -29,15 +34,38 @@ rescaled_science_img = np.load(rescaled_science_path)
 print(f"Template image loaded: shape {template_img.shape}, dtype {template_img.dtype}")
 print(f"Rescaled science image loaded: shape {rescaled_science_img.shape}, dtype {rescaled_science_img.dtype}")
 
+# Load WCS from FITS file
+print("\nLoading WCS from median_template.fits...")
+with fits.open(template_fits_path) as hdul:
+    header = hdul[0].header
+    wcs = WCS(header)
+
+if not wcs.is_celestial:
+    print("Warning: No valid celestial WCS found in median_template.fits. RA/Dec will be omitted.")
+    wcs = None
+
+
+# ────────────────────────────────────────────────
+# Helper: pixel (x,y) → RA/Dec (decimal + sexagesimal)
+# ────────────────────────────────────────────────
+def pixel_to_sky(x, y, wcs_obj):
+    if wcs_obj is None:
+        return None, None, None, None
+    ra_deg, dec_deg = wcs_obj.pixel_to_world_values(x, y)
+    coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs')
+    ra_hms = coord.ra.to_string(unit=u.hourangle, sep=':', precision=1)
+    dec_dms = coord.dec.to_string(unit=u.deg, sep=':', precision=1, alwayssign=True)
+    return ra_deg, dec_deg, ra_hms, dec_dms
+
+
+# ────────────────────────────────────────────────
 # Basic statistics
+# ────────────────────────────────────────────────
 print("\nTemplate image statistics:")
 print(f"  Min: {np.min(template_img):.1f}, Max: {np.max(template_img):.1f}, Mean: {np.mean(template_img):.1f}")
 
-# ────────────────────────────────────────────────
-# Find and report the single brightest pixel in the template
-# ────────────────────────────────────────────────
+# Brightest pixel in template
 print("\nSearching for the brightest pixel in the median template image...")
-
 if template_img.size == 0:
     print("  Template image is empty — cannot find brightest pixel.")
     x_max = y_max = None
@@ -48,7 +76,6 @@ else:
 
     print(f"  Brightest pixel value: {max_value:.1f} counts")
     print(f"  Location (x, y): ({x_max}, {y_max})")
-    print(f"  Location (y, x — numpy order): ({y_max}, {x_max})")
 
     half = 2
     y0 = max(0, y_max - half)
@@ -56,7 +83,7 @@ else:
     x0 = max(0, x_max - half)
     x1 = min(template_img.shape[1], x_max + half + 1)
 
-    print(f"  5×5 neighborhood around brightest pixel (values):")
+    print(f"  5×5 neighborhood around brightest pixel:")
     print(template_img[y0:y1, x0:x1])
 
 print("\nRescaled science image statistics:")
@@ -68,48 +95,36 @@ print(
 # ────────────────────────────────────────────────
 print("\nInjecting artificial 2D Gaussian source with total flux = 100 for testing...")
 
-# Make a working copy
 science_with_injection = rescaled_science_img.copy()
 
-# Gaussian parameters
 fwhm = 3.3
-sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))  # ≈ 1.699 pixels
+sigma = fwhm / (2 * np.sqrt(2 * np.log(2)))
 total_flux = 100.0
 
-# Patch size (odd number)
 patch_size = 11
 half_patch = patch_size // 2
 
-# Grid for the patch (relative coordinates)
 yy, xx = np.mgrid[-half_patch:half_patch + 1, -half_patch:half_patch + 1]
-
-# Normalized 2D Gaussian (integral over all space = 1)
-gauss = np.exp(- (xx ** 2 + yy ** 2) / (2 * sigma ** 2))
-gauss_integral = gauss.sum()  # approximate integral over 11×11
-gauss_normalized = gauss / gauss_integral
-
-# Scale to desired total flux
-gauss_patch = gauss_normalized * total_flux
+gauss = np.exp(-(xx ** 2 + yy ** 2) / (2 * sigma ** 2))
+gauss /= gauss.sum()
+gauss_patch = gauss * total_flux
 
 print(f"  Gaussian patch sum (≈ total flux): {gauss_patch.sum():.2f}")
 
-# Central 2000×2000 region
 ny, nx = template_img.shape
 center_y, center_x = ny // 2, nx // 2
-margin = half_patch + 10  # safety margin
+margin = half_patch + 10
 cy_min = center_y - 1000 + margin
 cy_max = center_y + 1000 - margin
 cx_min = center_x - 1000 + margin
 cx_max = center_x + 1000 - margin
 
-# Random integer position
-np.random.seed()  # remove or set fixed value for reproducibility
+np.random.seed()  # remove or set fixed for reproducibility
 inj_y = np.random.randint(cy_min, cy_max + 1)
 inj_x = np.random.randint(cx_min, cx_max + 1)
 
-print(f"  Injected Gaussian at (x, y) = ({inj_x}, {inj_y})")
+print(f"  Injected at (x, y) = ({inj_x}, {inj_y})")
 
-# Add the patch to the science image (handle edges)
 y0 = max(0, inj_y - half_patch)
 y1 = min(ny, inj_y + half_patch + 1)
 x0 = max(0, inj_x - half_patch)
@@ -122,45 +137,34 @@ patch_x1 = patch_x0 + (x1 - x0)
 
 science_with_injection[y0:y1, x0:x1] += gauss_patch[patch_y0:patch_y1, patch_x0:patch_x1]
 
-# Replace original science image with injected version
 rescaled_science_img = science_with_injection
-
-print("  Artificial Gaussian source injected successfully.")
+print("  Artificial source injected.")
 
 # ────────────────────────────────────────────────
-# Continue with the rest of the pipeline unchanged
+# Compute difference images
 # ────────────────────────────────────────────────
-
-# Compute difference: rescaled science - template
 difference = rescaled_science_img - template_img
 
 print("\nDifference (rescaled science − template) statistics:")
 print(
     f"  Min: {np.min(difference):.1f}, Max: {np.max(difference):.1f}, Mean: {np.mean(difference):.1f}, Std: {np.std(difference):.1f}")
 
-# Absolute value version of the difference
 abs_difference = np.abs(difference)
 abs_median = np.median(abs_difference)
-print(f"\nAbsolute difference median: {abs_median:.1f} counts")
+print(f"Absolute difference median: {abs_median:.1f} counts")
 
-# 3×3 boxcar sum-smoothed difference
-print("\nCreating 3×3 boxcar sum-smoothed difference image...")
 smoothed_sum_difference = uniform_filter(difference, size=3) * 9
-
-# Absolute value of the sum-smoothed difference
 abs_smoothed_sum = np.abs(smoothed_sum_difference)
-
-# Median of absolute sum-smoothed values
 smoothed_abs_median = np.median(abs_smoothed_sum)
 print(f"Median of absolute sum-smoothed difference: {smoothed_abs_median:.1f} counts")
 
-# Median multiplier and threshold
 median_multiplier = 10
 threshold = smoothed_abs_median * median_multiplier
-print(f"Median multiplier: {median_multiplier}")
 print(f"Threshold (median × {median_multiplier}): {threshold:.1f} counts")
 
+# ────────────────────────────────────────────────
 # Constants for star finding and culling
+# ────────────────────────────────────────────────
 saturation_threshold = 60000.0
 aperture_radius = 5.0
 aperture_max_threshold = 10000.0
@@ -169,7 +173,9 @@ duplicate_distance_threshold = 3.0
 bright_star_exclusion_radius = 100.0
 
 
+# ────────────────────────────────────────────────
 # Function to find star centroids and FWHM
+# ────────────────────────────────────────────────
 def find_star_centroids_and_fwhms(image_data, num_stars=20):
     background = np.median(image_data)
     data_sub = image_data - background
@@ -259,7 +265,9 @@ def find_star_centroids_and_fwhms(image_data, num_stars=20):
     return star_data
 
 
+# ────────────────────────────────────────────────
 # Characterize PSF in the median template image
+# ────────────────────────────────────────────────
 print("\nCharacterizing PSF in the median template image...")
 template_psf_data = find_star_centroids_and_fwhms(template_img, num_stars=50)
 
@@ -274,7 +282,9 @@ else:
     print(f"  Median FWHM: {median_fwhm:.2f} pixels")
     print(f"  Mean FWHM: {mean_fwhm:.2f} pixels (± {std_fwhm:.2f} pixels)")
 
-# Create master empirical PSF by stacking cutouts from PSF stars
+# ────────────────────────────────────────────────
+# Create master empirical PSF by stacking cutouts
+# ────────────────────────────────────────────────
 print("\nCreating master empirical PSF by stacking cutouts from PSF stars...")
 cutout_size = 41
 half_cut = cutout_size // 2
@@ -314,7 +324,6 @@ else:
     master_psf = np.zeros((cutout_size, cutout_size))
     print("No cutouts available for master PSF.")
 
-# Display the master PSF
 plt.figure(figsize=(8, 8))
 plt.imshow(master_psf, cmap='viridis', origin='lower', vmin=0)
 plt.title('Master Empirical PSF\n(Median stack of normalized 41×41 cutouts)')
@@ -322,12 +331,13 @@ plt.colorbar(label='Normalized flux')
 plt.tight_layout()
 plt.show(block=False)
 
-# Save master PSF
 master_psf_path = os.path.join(os.getcwd(), "master_psf.npy")
 np.save(master_psf_path, master_psf)
 print(f"Master PSF saved to {master_psf_path}")
 
+# ────────────────────────────────────────────────
 # Initial candidates for transients
+# ────────────────────────────────────────────────
 print("\nFinding initial candidate pixels exceeding threshold...")
 y_indices, x_indices = np.where(abs_smoothed_sum > threshold)
 candidates = list(zip(x_indices, y_indices))
@@ -335,7 +345,9 @@ values = abs_smoothed_sum[y_indices, x_indices].tolist()
 
 print(f"Found {len(candidates)} initial candidate pixels")
 
+# ────────────────────────────────────────────────
 # Edge culling
+# ────────────────────────────────────────────────
 print("\nEdge culling: eliminating candidates within 50 pixels of image edges...")
 ny, nx = abs_smoothed_sum.shape
 edge_margin_candidates = 50
@@ -352,7 +364,9 @@ values = [val for _, val in edge_culled]
 
 print(f"After edge culling: {len(candidates)} candidates remain")
 
+# ────────────────────────────────────────────────
 # Adjacency culling
+# ────────────────────────────────────────────────
 print("\nAdjacency culling: keeping brightest within 5 pixels...")
 culled_candidates = []
 
@@ -374,9 +388,9 @@ candidates = culled_candidates
 
 print(f"After adjacency culling: {len(candidates)} unique bright candidates remain")
 
-# ──────────────────────────────────────────────────────────────
-# Exclude candidates within 100 pixels of the brightest pixel
-# ──────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────
+# Exclude candidates near brightest pixel
+# ────────────────────────────────────────────────
 print(
     f"\nExcluding candidates within {bright_star_exclusion_radius} pixels of the brightest pixel ({x_max}, {y_max})...")
 
@@ -399,13 +413,12 @@ else:
 print(f"  Removed {excluded_count} candidates within {bright_star_exclusion_radius} pixels of brightest pixel.")
 print(f"  Remaining candidates: {len(candidates)}")
 
-# 3×3 boxcar sum-smoothed template for Poisson culling
-print("\nCreating 3×3 boxcar sum-smoothed template image...")
-smoothed_template = uniform_filter(template_img, size=3) * 9
-
+# ────────────────────────────────────────────────
 # Secondary Poisson culling
+# ────────────────────────────────────────────────
+print("\nSecondary culling with poisson_multiplier = 5...")
 poisson_multiplier = 5
-print(f"\nSecondary culling with poisson_multiplier = {poisson_multiplier}")
+smoothed_template = uniform_filter(template_img, size=3) * 9
 
 final_candidates = []
 for x, y in candidates:
@@ -420,22 +433,21 @@ candidates = final_candidates
 
 print(f"After secondary Poisson culling: {len(candidates)} candidates remain")
 
-# Fit each final candidate to master PSF + local background over 5x5 region (background >= 0)
+# ────────────────────────────────────────────────
+# Fit each final candidate to master PSF + local background (5x5 region)
+# ────────────────────────────────────────────────
 print("\nFitting final candidates to master PSF + local background (5x5 region, background >= 0)...")
 
-# Crop master PSF to central 5x5 for fitting
 psf_fit_size = 5
 psf_half = psf_fit_size // 2
 master_psf_central = master_psf[half_cut - psf_half:half_cut + psf_half + 1,
                      half_cut - psf_half:half_cut + psf_half + 1]
 
-# Flatten for fitting
 psf_vec = master_psf_central.flatten()
 psf_sum = np.sum(psf_vec)
 
-fit_results = []
+psf_fit_results = []
 for i, (x, y) in enumerate(candidates):
-    # Extract 5x5 cutout from rescaled science image
     x0 = int(x - psf_half)
     x1 = int(x + psf_half + 1)
     y0 = int(y - psf_half)
@@ -444,61 +456,155 @@ for i, (x, y) in enumerate(candidates):
     cutout = rescaled_science_img[y0:y1, x0:x1]
     data_vec = cutout.flatten()
 
-    # Design matrix: PSF vector and constant for background
     design = np.vstack([psf_vec, np.ones(psf_fit_size ** 2)]).T
-
-    # Unconstrained least squares fit
     params = np.linalg.lstsq(design, data_vec, rcond=None)[0]
     amplitude, background = params
 
-    # Enforce background >= 0
     if background < 0:
-        # Fix background to 0 and refit amplitude only
-        design_fixed = psf_vec[:, np.newaxis]
-        amplitude = np.linalg.lstsq(design_fixed, data_vec, rcond=None)[0][0]
+        amplitude = np.linalg.lstsq(psf_vec[:, np.newaxis], data_vec, rcond=None)[0][0]
         background = 0.0
 
-    # Total flux
     flux = amplitude * psf_sum
-
-    # Final model and chi-squared
     model = amplitude * psf_vec + background
     chi2 = np.sum((data_vec - model) ** 2)
     dof = psf_fit_size ** 2 - 2
     chi2_dof = chi2 / dof if dof > 0 else np.nan
 
-    fit_results.append((flux, background, chi2_dof))
-
-# Tertiary culling: remove candidates with chi2/dof > 10
-print("\nTertiary culling: eliminating candidates with chi²/dof > 10...")
-good_fit_candidates = []
-good_fit_results = []
-
-for i in range(len(candidates)):
-    chi2_dof = fit_results[i][2]
-    if chi2_dof <= 10.0:
-        good_fit_candidates.append(candidates[i])
-        good_fit_results.append(fit_results[i])
-
-candidates = good_fit_candidates
-fit_results = good_fit_results
-
-print(f"After chi²/dof culling: {len(candidates)} candidates remain")
-
-# Print revised table with fit parameters
-if len(candidates) > 0:
-    print("Revised final candidates with PSF fit parameters (5x5 region, background >= 0):")
-    print("  #    (x, y)      residual    flux       background   chi2/dof")
-    for i in range(len(candidates)):
-        x, y = candidates[i]
-        residual = abs_smoothed_sum[y, x]
-        flux, bg, chi2_dof = fit_results[i]
-        print(f"  {i + 1:2d}: ({x:4d}, {y:4d})  {residual:8.1f}  {flux:8.1f}  {bg:8.1f}  {chi2_dof:6.2f}")
-else:
-    print("No candidates remain after chi²/dof culling.")
+    psf_fit_results.append((flux, background, chi2_dof))
 
 # ────────────────────────────────────────────────
-# Display 30×30 postage stamps for each final candidate
+# 2D Gaussian + background fit for each candidate (separate x/y widths)
+# ────────────────────────────────────────────────
+print("\nPerforming 2D Gaussian + background fit for each candidate (5x5 region, background >= 0)...")
+
+gauss_fit_results = []
+fitter = fitting.LevMarLSQFitter()
+
+for i, (x, y) in enumerate(candidates):
+    x0 = int(x - psf_half)
+    x1 = int(x + psf_half + 1)
+    y0 = int(y - psf_half)
+    y1 = int(y + psf_half + 1)
+
+    cutout = rescaled_science_img[y0:y1, x0:x1]
+
+    yy, xx = np.mgrid[:cutout.shape[0], :cutout.shape[1]]
+
+    g_init = models.Gaussian2D(
+        amplitude=cutout.max(),
+        x_mean=psf_half,
+        y_mean=psf_half,
+        x_stddev=1.0,
+        y_stddev=1.0
+    ) + models.Const2D(amplitude=0.0)
+
+    try:
+        g_fit = fitter(g_init, xx, yy, cutout)
+
+        # Enforce background >= 0
+        if g_fit[1].amplitude.value < 0:
+            g_init[1].amplitude.fixed = True
+            g_init[1].amplitude.value = 0.0
+            g_fit = fitter(g_init, xx, yy, cutout)
+
+        # Flux = amplitude * 2π * σ_x * σ_y
+        flux = g_fit[0].amplitude.value * 2 * np.pi * g_fit[0].x_stddev.value * g_fit[0].y_stddev.value
+
+        # FWHM for each axis
+        fwhm_x = 2.355 * g_fit[0].x_stddev.value
+        fwhm_y = 2.355 * g_fit[0].y_stddev.value
+
+        # Ellipticity (ratio of larger to smaller axis)
+        ellipticity = max(fwhm_x, fwhm_y) / min(fwhm_x, fwhm_y) if min(fwhm_x, fwhm_y) > 0 else 1.0
+
+        background = g_fit[1].amplitude.value
+
+        # Chi-squared / dof
+        model = g_fit(xx, yy)
+        chi2 = np.sum((cutout - model) ** 2)
+        dof = cutout.size - 6  # Gaussian2D: 5 params + 1 const
+        chi2_dof = chi2 / dof if dof > 0 else np.nan
+
+        gauss_fit_results.append((flux, fwhm_x, fwhm_y, ellipticity, background, chi2_dof))
+
+    except Exception as e:
+        print(f"Gaussian fit failed for candidate {i + 1}: {e}")
+        gauss_fit_results.append((np.nan, np.nan, np.nan, np.nan, np.nan, np.nan))
+
+# ────────────────────────────────────────────────
+# Tertiary culling: χ²/dof ≤ 10
+# ────────────────────────────────────────────────
+print("\nTertiary culling: eliminating candidates with χ²/dof > 10...")
+good_candidates = []
+good_psf_fits = []
+good_gauss_fits = []
+
+for i in range(len(candidates)):
+    psf_chi2_dof = psf_fit_results[i][2]
+    if psf_chi2_dof <= 10.0:
+        good_candidates.append(candidates[i])
+        good_psf_fits.append(psf_fit_results[i])
+        good_gauss_fits.append(gauss_fit_results[i])
+
+candidates = good_candidates
+psf_fit_results = good_psf_fits
+gauss_fit_results = good_gauss_fits
+print(f"After χ²/dof culling: {len(candidates)} candidates remain")
+
+# ────────────────────────────────────────────────
+# Final candidate table with RA/Dec, PSF fit, and Gaussian fit (separate widths)
+# ────────────────────────────────────────────────
+print("\n" + "=" * 200)
+print("FINAL CANDIDATES WITH RA/DEC (from WCS), PSF FIT, AND GAUSSIAN FIT (separate X/Y widths)")
+print("=" * 200)
+print(
+    " #   X pix   Y pix      RA (deg)     Dec (deg)      RA (hms)        Dec (dms)      PSF Flux   PSF χ²/dof    Gauss Flux   FWHM X    FWHM Y    Ellip   Gauss BG   Gauss χ²/dof")
+print("-" * 200)
+
+table_rows = []
+
+for i, (x, y) in enumerate(candidates):
+    ra_deg, dec_deg, ra_hms, dec_dms = pixel_to_sky(x, y, wcs)
+    psf_flux, psf_bg, psf_chi2_dof = psf_fit_results[i]
+    gauss_flux, fwhm_x, fwhm_y, ellipticity, gauss_bg, gauss_chi2_dof = gauss_fit_results[i]
+
+    if ra_deg is not None:
+        ra_deg_str = f"{ra_deg:11.5f}"
+        dec_deg_str = f"{dec_deg:11.5f}"
+        ra_hms_str = f"{ra_hms:>15}"
+        dec_dms_str = f"{dec_dms:>15}"
+    else:
+        ra_deg_str = dec_deg_str = ra_hms_str = dec_dms_str = "— no WCS —"
+
+    print(
+        f"{i + 1:2d}  {x:7.1f}  {y:7.1f}  {ra_deg_str}  {dec_deg_str}  {ra_hms_str}  {dec_dms_str}  {psf_flux:10.1f}  {psf_chi2_dof:10.2f}  {gauss_flux:10.1f}  {fwhm_x:8.2f}  {fwhm_y:8.2f}  {ellipticity:5.2f}  {gauss_bg:10.1f}  {gauss_chi2_dof:12.2f}")
+
+    table_rows.append({
+        'Index': i + 1,
+        'X_pix': round(x, 1),
+        'Y_pix': round(y, 1),
+        'RA_deg': ra_deg,
+        'Dec_deg': dec_deg,
+        'RA_hms': ra_hms if ra_hms else "—",
+        'Dec_dms': dec_dms if dec_dms else "—",
+        'PSF_Flux': round(psf_flux, 1),
+        'PSF_χ²/dof': round(psf_chi2_dof, 2) if not np.isnan(psf_chi2_dof) else "—",
+        'Gauss_Flux': round(gauss_flux, 1),
+        'FWHM_X': round(fwhm_x, 2),
+        'FWHM_Y': round(fwhm_y, 2),
+        'Gauss_Ellip': round(ellipticity, 2),
+        'Gauss_BG': round(gauss_bg, 1),
+        'Gauss_χ²/dof': round(gauss_chi2_dof, 2) if not np.isnan(gauss_chi2_dof) else "—"
+    })
+
+print("=" * 200)
+
+df_final = pd.DataFrame(table_rows)
+print("\nFinal candidates table (pandas format):")
+print(df_final.to_string(index=False))
+
+# ────────────────────────────────────────────────
+# Display 30×30 postage stamps with RA/Dec and Gaussian fit info
 # ────────────────────────────────────────────────
 print("\nGenerating 30×30 postage stamps around final candidates (from rescaled science image)...")
 
@@ -506,11 +612,15 @@ stamp_size = 30
 half_stamp = stamp_size // 2
 
 for i, (x, y) in enumerate(candidates):
+    ra_deg, dec_deg, ra_hms, dec_dms = pixel_to_sky(x, y, wcs)
+    title_coord = f"RA {ra_hms or '—'}, Dec {dec_dms or '—'}" if ra_hms else "No WCS"
+
+    flux_val, fwhm_x, fwhm_y, ellipticity, bg_val, chi2dof_val = gauss_fit_results[i]
+
     plt.figure(figsize=(6, 6))
 
     x_c = int(np.round(x))
     y_c = int(np.round(y))
-
     y0 = max(0, y_c - half_stamp)
     y1 = min(rescaled_science_img.shape[0], y_c + half_stamp + 1)
     x0 = max(0, x_c - half_stamp)
@@ -525,9 +635,8 @@ for i, (x, y) in enumerate(candidates):
     plt.plot(x - x0 + 0.5, y - y0 + 0.5, marker='+', color='red',
              markersize=16, markeredgewidth=2.5, label='Candidate position')
 
-    flux_val, bg_val, chi2dof_val = fit_results[i]
-    plt.title(f"Candidate {i + 1}   ({x:.1f}, {y:.1f})\n"
-              f"flux = {flux_val:.1f}    χ²/dof = {chi2dof_val:.2f}")
+    plt.title(f"Candidate {i + 1}   ({x:.1f}, {y:.1f})\n{title_coord}\n"
+              f"Gauss flux = {flux_val:.1f}   FWHM X/Y = {fwhm_x:.2f}/{fwhm_y:.2f} px   Ellip = {ellipticity:.2f}")
     plt.xlabel("pixel offset")
     plt.ylabel("pixel offset")
     plt.legend(loc='upper right', fontsize=10)
@@ -539,7 +648,9 @@ for i, (x, y) in enumerate(candidates):
 
 print(f"All {len(candidates)} final candidates shown as individual 30×30 stamps.")
 
-# Display FULL rescaled science image with red circles (diameter 20 px) around final candidates
+# ────────────────────────────────────────────────
+# Full rescaled science image with red circles on candidates
+# ────────────────────────────────────────────────
 print("\nDisplaying FULL rescaled science image with red circles (diameter 20 px) on all final candidates...")
 plt.figure(figsize=(20, 20))
 plt.imshow(rescaled_science_img, cmap='gray', origin='lower',
@@ -560,9 +671,10 @@ plt.show(block=False)
 
 print(f"All {len(candidates)} final candidates are marked on the full image.")
 
-# Pre-compute central 2000×2000 regions for other displays
+# ────────────────────────────────────────────────
+# Central 2000×2000 regions in 2x2 grid
+# ────────────────────────────────────────────────
 half_large = 1000
-ny, nx = template_img.shape
 center_y_large, center_x_large = ny // 2, nx // 2
 
 template_central_large = template_img[center_y_large - half_large:center_y_large + half_large,
@@ -574,10 +686,8 @@ diff_central_large = difference[center_y_large - half_large:center_y_large + hal
 abs_diff_central_large = abs_difference[center_y_large - half_large:center_y_large + half_large,
                          center_x_large - half_large:center_x_large + half_large]
 
-# 2×2 grid layout for large central regions
 plt.figure(figsize=(24, 24))
 
-# Template (top-left)
 plt.subplot(2, 2, 1)
 plt.imshow(template_central_large, cmap='gray', origin='lower',
            vmin=np.percentile(template_central_large, 1),
@@ -587,7 +697,6 @@ plt.xlabel('X pixel')
 plt.ylabel('Y pixel')
 plt.colorbar(shrink=0.8)
 
-# Rescaled science (top-right)
 plt.subplot(2, 2, 2)
 plt.imshow(science_central_large, cmap='gray', origin='lower',
            vmin=np.percentile(science_central_large, 1),
@@ -597,7 +706,6 @@ plt.xlabel('X pixel')
 plt.ylabel('Y pixel')
 plt.colorbar(shrink=0.8)
 
-# Difference (bottom-left)
 vmax = np.std(diff_central_large) * 3
 plt.subplot(2, 2, 3)
 plt.imshow(diff_central_large, cmap='RdBu', origin='lower',
@@ -607,7 +715,6 @@ plt.xlabel('X pixel')
 plt.ylabel('Y pixel')
 plt.colorbar(label='Difference (counts)', shrink=0.8)
 
-# Absolute difference (bottom-right)
 vmax_abs = np.percentile(abs_diff_central_large, 99.5)
 plt.subplot(2, 2, 4)
 plt.imshow(abs_diff_central_large, cmap='viridis', origin='lower',
@@ -620,7 +727,9 @@ plt.colorbar(label='Absolute Difference (counts)', shrink=0.8)
 plt.tight_layout()
 plt.show(block=False)
 
-# 100×100 zooms of the two difference images centered on (x=1699, y=2154)
+# ────────────────────────────────────────────────
+# 100×100 zoom around (1699, 2154)
+# ────────────────────────────────────────────────
 print("\nDisplaying 100×100 zoom around (1699, 2154)...")
 zoom_center_x = 1699
 zoom_center_y = 2154
@@ -633,7 +742,6 @@ abs_diff_zoom = abs_difference[zoom_center_y - zoom_half:zoom_center_y + zoom_ha
 
 plt.figure(figsize=(24, 12))
 
-# Difference zoom
 vmax_zoom = np.std(diff_zoom) * 3
 plt.subplot(1, 2, 1)
 plt.imshow(diff_zoom, cmap='RdBu', origin='lower',
@@ -643,7 +751,6 @@ plt.xlabel('X pixel')
 plt.ylabel('Y pixel')
 plt.colorbar(label='Difference (counts)', shrink=0.8)
 
-# Absolute difference zoom
 vmax_abs_zoom = np.percentile(abs_diff_zoom, 99.5)
 plt.subplot(1, 2, 2)
 plt.imshow(abs_diff_zoom, cmap='viridis', origin='lower',
@@ -657,12 +764,14 @@ plt.colorbar(label='Absolute Difference (counts)', shrink=0.8)
 plt.tight_layout()
 plt.show(block=False)
 
-# Histogram of the absolute difference values (central region) with logarithmic y-axis
+# ────────────────────────────────────────────────
+# Histogram of absolute difference (central region, log y-axis)
+# ────────────────────────────────────────────────
 print("\nDisplaying histogram of the absolute difference values (central 2000×2000 region)...")
 plt.figure(figsize=(12, 8))
 plt.hist(abs_diff_central_large.flatten(), bins=200, color='skyblue', alpha=0.7,
          edgecolor='black')
-plt.yscale('log')  # Logarithmic vertical axis
+plt.yscale('log')
 plt.axvline(abs_median, color='red', linestyle='--', linewidth=2, label=f'Median: {abs_median:.2f}')
 plt.axvline(np.mean(abs_diff_central_large), color='orange', linestyle=':', linewidth=2,
             label=f'Mean: {np.mean(abs_diff_central_large):.2f}')
@@ -672,6 +781,6 @@ plt.ylabel('Number of pixels (log scale)')
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
-plt.show()  # last plot can be blocking
+plt.show()
 
 print(f"Absolute difference median (whole image): {abs_median:.1f} counts")
