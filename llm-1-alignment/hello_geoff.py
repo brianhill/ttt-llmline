@@ -8,7 +8,19 @@ from astropy.modeling import models, fitting
 from scipy.spatial import KDTree
 import pandas as pd
 
-# Your original configuration (kept exactly as provided)
+# Added imports for plate-solving and WCS
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+from astropy.wcs import WCS
+from astroquery.astrometry_net import AstrometryNet
+
+# Import for suppressing the harmless warning
+import warnings
+from astropy.wcs import FITSFixedWarning
+
+# ────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ────────────────────────────────────────────────────────────────
 cwd = os.getcwd()
 image_directory_path = "/Volumes/Astronomy Data/2025 TTT Targets/ttt-00167/bin3x3"
 prefix = "TTT1_QHY411-1_2025-04-26-23-0"
@@ -22,40 +34,6 @@ num_images_for_template = 7  # Number of first images to use for median template
 
 ###############################################################################
 # IMAGE LOADING BLOCK
-#
-# This section reads the calibrated FITS images from disk.
-#
-# Key points:
-# - The files are assumed to be fully calibrated science frames
-#   (bias, dark, flat-field corrections already applied).
-# - Many astronomical cameras (including QHY series) store raw or calibrated
-#   pixel data as unsigned 16-bit integers (UINT16 / BITPIX=16, BZERO=32768, BSCALE=1).
-# - astropy.io.fits automatically handles the FITS scaling keywords (BSCALE/BZERO)
-#   and returns data as signed integers or floats, correctly mapping the unsigned
-#   range 0–65535 to positive values.
-# - However, to guarantee safe handling regardless of header keywords and to
-#   prevent any risk of negative values due to signed interpretation, we:
-#     1. Open with uint=True → forces astropy to treat the raw pixel data as
-#        unsigned integers (no sign interpretation).
-#     2. Immediately convert to np.float32 → preserves the exact original values
-#        (0–65535) as positive floats and allows safe arithmetic without overflow.
-#     3. After conversion, any remaining negative values (which should not occur
-#        with proper calibration but can appear due to over-subtraction) are
-#        replaced with 32768.0 — the conventional "zero" level for unsigned 16-bit
-#        data (corresponding to BZERO in FITS headers).
-#
-# Benefits:
-# - Large UINT16 values (e.g., >32767) will never become negative.
-# - All subsequent operations (subtraction, median, shifts) are performed in
-#   floating point with full precision.
-#
-# Potential sources of artifacts:
-# - If calibration produced negative values that were clipped to zero, or if
-#   BZERO/BSCALE were incorrect, residual patterns may remain.
-# - Residual flat-field gradients or illumination mismatches can persist.
-#
-# Recommendation: Always verify a few frames visually and check header keywords
-# (BITPIX, BZERO, BSCALE) to confirm data integrity.
 ###############################################################################
 def load_matching_fits_images(dir_path, file_prefix, file_suffix):
     pattern = os.path.join(dir_path, file_prefix + "*" + file_suffix)
@@ -72,14 +50,11 @@ def load_matching_fits_images(dir_path, file_prefix, file_suffix):
 
     image_arrays = []
     for filepath in matching_files:
-        # Open FITS with uint=True to correctly interpret unsigned integer data
         with fits.open(filepath, uint=True) as hdul:
             data = hdul[0].data
             if data is None:
                 raise ValueError(f"No image data in primary HDU of {filepath}")
-            # Convert to float32 to preserve exact values and enable safe arithmetic
             float_data = np.array(data, dtype=np.float32)
-            # Replace any negative values (from over-subtraction) with 32768.0 (UINT16 zero level)
             float_data[float_data < 0] = 32768.0
             image_arrays.append(float_data)
 
@@ -170,7 +145,6 @@ def find_suitable_bright_star(star_data, image_shape, max_dist_from_center=2000.
 
     candidates.sort(key=lambda t: (t[0], -t[1]))
 
-    # Select the SECOND candidate
     _, _, best_x, best_y = candidates[1]
 
     for entry in star_data:
@@ -200,7 +174,12 @@ def align_images(template, target, template_star_data, num_stars=20):
     if len(template_star_data) < 5 or len(targ_star_data) < 5:
         raise ValueError("Insufficient stars for alignment.")
 
-    template_pos = np.array([[x, y] for x, y, _, _ in template_star_data])
+    # Handle both old list-of-tuples and new list-of-dicts
+    if isinstance(template_star_data[0], dict):
+        template_pos = np.array([[s['pixel_x'], s['pixel_y']] for s in template_star_data])
+    else:
+        template_pos = np.array([[x, y] for x, y, _, _ in template_star_data])
+
     targ_pos = np.array([[x, y] for x, y, _, _ in targ_star_data])
 
     tree = KDTree(targ_pos)
@@ -228,21 +207,6 @@ def align_images(template, target, template_star_data, num_stars=20):
     shift_x, shift_y = mean_delta
     aligned_shift_y, aligned_shift_x = -shift_y, -shift_x
 
-    # ==============================================================================
-    # KEY STEP: Sub-pixel image displacement via interpolation
-    #
-    # The following line performs the actual alignment of the target image to the
-    # template by shifting it by the computed (sub-pixel) offsets.
-    #
-    # - shift() from scipy.ndimage uses spline interpolation.
-    # - order=5 specifies 5th-order (quintic) spline interpolation for high accuracy.
-    # - mode='constant' fills areas outside the original image with a constant value.
-    # - cval=np.median(target) uses the median of the target image as the fill value
-    #   to avoid introducing bright or dark edges.
-    #
-    # This interpolation allows precise sub-pixel shifts without resampling artifacts
-    #   that would degrade the subtraction quality.
-    # ==============================================================================
     aligned = shift(target, (aligned_shift_y, aligned_shift_x), order=5, mode='constant', cval=np.median(target))
 
     for entry in matched_data:
@@ -265,39 +229,17 @@ if __name__ == "__main__":
 
         print(f"\nTotal number of images in the sequence: {len(images_data)}")
 
-        # Use last image as target
         targ_img = images_data[-1]
         file2 = image_files[-1]
 
         print(f"\nTarget (last in sequence): {os.path.basename(file2)}")
 
-        ############################################################################
-        # TEMPLATE GENERATION BLOCK
-        #
-        # This block creates a high-quality median template from the first
-        # num_images_for_template images in the sequence.
-        #
-        # 1. The very first image is used as the alignment base.
-        # 2. Star centroids are measured on this base image.
-        # 3. Each subsequent image (2nd through 7th) is aligned to the base using
-        #    the same centroid-matching and sub-pixel shift method as the main
-        #    alignment.
-        # 4. A pixel-by-pixel median is computed across the 7 aligned images.
-        #
-        # Benefits:
-        #   - Cosmic rays and transient artifacts are rejected by the median.
-        #   - Signal-to-noise is improved.
-        #   - The template remains photometrically consistent with the individual
-        #     frames.
-        #
-        # The resulting template_img is used for all further analysis and subtraction.
-        ############################################################################
         print(f"\nCreating median template from the first {num_images_for_template} images...")
         first_images = images_data[:num_images_for_template]
         template_base = first_images[0]
         template_star_data = find_star_centroids_and_fwhms(template_base, num_stars_for_alignment)
 
-        aligned_first_images = [template_base]  # First image is already aligned to itself
+        aligned_first_images = [template_base]
         for img in first_images[1:]:
             aligned_img, _ = align_images(template_base, img, template_star_data, num_stars_for_alignment)
             aligned_first_images.append(aligned_img)
@@ -305,7 +247,101 @@ if __name__ == "__main__":
         template_img = np.median(aligned_first_images, axis=0)
         print("Median template created.")
 
-        # Display central 1000×1000 of the template
+        # ────────────────────────────────────────────────────────────────
+        # PLATE SOLVING BLOCK
+        # Uses ICRS coordinates (J2000.0 equinox) – Astrometry.net returns ICRS
+        # ────────────────────────────────────────────────────────────────
+        print("\nAttempting plate-solving on the median template (using ICRS / J2000.0 coordinates)...")
+
+        center_guess = SkyCoord(
+            ra="12h30m30s",
+            dec="+12d21m05s",
+            frame='icrs',
+            equinox='J2000'
+        )
+
+        plate_scale_arcsec_per_pix = 0.44
+
+        ny, nx = template_img.shape
+        approx_fov_deg = max(nx, ny) * (plate_scale_arcsec_per_pix / 3600.0) * 1.15
+
+        ast = AstrometryNet()
+        ast.api_key = 'paurzuggyfqztyup'
+
+        template_wcs = None
+        solved_header = None
+
+        try:
+            temp_path = os.path.join(cwd, "temp_median_template_for_solve.fits")
+            fits.PrimaryHDU(template_img).writeto(temp_path, overwrite=True)
+
+            solved_header = ast.solve_from_image(
+                temp_path,
+                center_ra=center_guess.ra.deg,
+                center_dec=center_guess.dec.deg,
+                radius=approx_fov_deg / 2.0,
+                scale_lower=plate_scale_arcsec_per_pix * 0.65,
+                scale_upper=plate_scale_arcsec_per_pix * 1.35,
+                scale_units='arcsecperpix',
+                solve_timeout=300,
+                verbose=True
+            )
+
+            print("Plate solving succeeded! WCS solution is in ICRS (J2000.0) frame.")
+
+            # Suppress the common harmless FITSFixedWarning about axes mismatch
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", FITSFixedWarning)
+                template_wcs = WCS(solved_header)
+
+            # Enrich template_star_data with sky coordinates (ICRS/J2000)
+            enriched = []
+            for orig in template_star_data:
+                x, y, fwhm, peak = orig
+                ra_deg, dec_deg = template_wcs.pixel_to_world_values(x, y)
+                coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs', equinox='J2000')
+                enriched.append({
+                    'pixel_x': x,
+                    'pixel_y': y,
+                    'fwhm_pix': fwhm,
+                    'peak_counts': peak,
+                    'ra_deg': ra_deg,
+                    'dec_deg': dec_deg,
+                    'ra_hms': coord.ra.to_string(unit=u.hourangle, sep=':', precision=1),
+                    'dec_dms': coord.dec.to_string(unit=u.deg, sep=':', precision=1, alwayssign=True)
+                })
+
+            template_star_data = enriched
+            print(f"Added ICRS (J2000.0) RA/Dec to {len(template_star_data)} template stars.")
+
+        except Exception as e:
+            print(f"Plate solving failed: {e}")
+            print("Continuing with pixel coordinates only (no WCS).")
+
+        # ────────────────────────────────────────────────────────────────
+        # Save the final median template — with WCS if available
+        # ────────────────────────────────────────────────────────────────
+        template_output_path = os.path.join(cwd, "median_template.fits")
+
+        if solved_header is not None:
+            hdu = fits.PrimaryHDU(template_img, header=solved_header)
+            print("Saving median template with embedded ICRS (J2000.0) WCS header.")
+        else:
+            hdu = fits.PrimaryHDU(template_img)
+            print("Saving median template without WCS (plate solving failed).")
+
+        hdu.writeto(template_output_path, overwrite=True)
+        print(f"Median template saved to: {template_output_path}")
+
+        if solved_header is not None:
+            solved_path = os.path.join(cwd, "median_template_solved.fits")
+            fits.PrimaryHDU(template_img, header=solved_header).writeto(solved_path, overwrite=True)
+            print(f"Solved template (with explicit WCS) saved: {solved_path}")
+
+        # ────────────────────────────────────────────────────────────────
+        # The rest of your plotting / analysis code (unchanged)
+        # ────────────────────────────────────────────────────────────────
+
         ny, nx = template_img.shape
         half = 500
         center_y_t, center_x_t = ny // 2, nx // 2
@@ -322,7 +358,6 @@ if __name__ == "__main__":
         plt.tight_layout()
         plt.show()
 
-        # Display central 1000×1000 of all seven aligned images used for the template
         print("\nDisplaying central 1000×1000 pixels of the seven aligned images used to build the template...")
         fig, axs = plt.subplots(2, 4, figsize=(20, 10))
         axs = axs.ravel()
@@ -338,14 +373,11 @@ if __name__ == "__main__":
             axs[i].set_ylabel('Y pixel')
             fig.colorbar(im, ax=axs[i], shrink=0.8)
 
-        # Hide the empty 8th subplot
         axs[7].axis('off')
-
         plt.suptitle('Central 1000×1000 pixels of the 7 aligned images used for the median template')
         plt.tight_layout()
         plt.show()
 
-        # Display central 1000×1000 of the original (unaligned) seven images
         print("\nDisplaying central 1000×1000 pixels of the original (unaligned) seven images used for the template...")
         fig_un, axs_un = plt.subplots(2, 4, figsize=(20, 10))
         axs_un = axs_un.ravel()
@@ -361,9 +393,7 @@ if __name__ == "__main__":
             axs_un[i].set_ylabel('Y pixel')
             fig_un.colorbar(im_un, ax=axs_un[i], shrink=0.8)
 
-        # Hide the empty 8th subplot
         axs_un[7].axis('off')
-
         plt.suptitle('Central 1000×1000 pixels of the 7 original (unaligned) images used for the median template')
         plt.tight_layout()
         plt.show()
@@ -375,9 +405,14 @@ if __name__ == "__main__":
         center_y, center_x, template_star_peak = find_suitable_bright_star(template_star_data, template_img.shape)
         print(f"Selected star at (x, y) = ({center_x:.2f}, {center_y:.2f})")
         print(f"Maximum value at the peak pixel of this template star: {template_star_peak:.1f} counts")
+
+        if template_wcs is not None:
+            ra_deg, dec_deg = template_wcs.pixel_to_world_values(center_x, center_y)
+            coord = SkyCoord(ra_deg, dec_deg, unit='deg', frame='icrs', equinox='J2000')
+            print(f"Selected star sky coordinates (ICRS/J2000): {coord.to_string('hmsdms')}")
+
         zoom_half_size = int(5 * fwhm_pixels)
 
-        # Compute differences
         unaligned_diff = template_img - targ_img
 
         print("\nAligning target image to template using star centroids...")
@@ -386,24 +421,17 @@ if __name__ == "__main__":
 
         aligned_diff = template_img - aligned_target
 
-        # Local max in template star (original image)
         local_template_patch = extract_local_patch(template_img, center_y, center_x, radius=5)
         local_template_max = np.max(local_template_patch)
 
-        # Local min/max in aligned difference around the same star
         local_diff_patch = extract_local_patch(aligned_diff, center_y, center_x, radius=5)
         local_diff_min = np.min(local_diff_patch)
         local_diff_max = np.max(local_diff_patch)
 
-        # Save differences
         unaligned_output_path = os.path.join(cwd, "unaligned_template_last_difference.fits")
         aligned_output_path = os.path.join(cwd, "aligned_template_last_difference.fits")
         fits.PrimaryHDU(unaligned_diff).writeto(unaligned_output_path, overwrite=True)
         fits.PrimaryHDU(aligned_diff).writeto(aligned_output_path, overwrite=True)
-
-        # Also save the template image
-        template_output_path = os.path.join(cwd, "median_template.fits")
-        fits.PrimaryHDU(template_img).writeto(template_output_path, overwrite=True)
 
         print("\nUnaligned difference (global):")
         print(f"  Mean: {np.mean(unaligned_diff):.4f}   Std: {np.std(unaligned_diff):.4f}")
@@ -416,11 +444,10 @@ if __name__ == "__main__":
         print(
             f"\nNote: Local template star max in original image: {local_template_max:.1f} counts (should match peak above)")
         print(f"\nImages saved to:")
-        print(f"  Median template: {template_output_path}")
+        print(f"  Median template (with WCS if solved): {template_output_path}")
         print(f"  Unaligned difference: {unaligned_output_path}")
         print(f"  Aligned difference: {aligned_output_path}")
 
-        # Centroid table
         print("\n" + "=" * 100)
         print("CENTROID TABLE FOR MATCHED STARS")
         print("=" * 100)
@@ -431,11 +458,9 @@ if __name__ == "__main__":
         print(df_centroids.to_string(index=False))
         print("=" * 100)
 
-        # Display zoomed differences
         fig, axs = plt.subplots(1, 2, figsize=(20, 8), sharey=True)
 
-        # Define relative coordinates from -15 to +15 around the selected star
-        rel_extent = [-15.5, 15.5, -15.5, 15.5]  # half-pixel offset for correct centering
+        rel_extent = [-15.5, 15.5, -15.5, 15.5]
 
         im0 = axs[0].imshow(unaligned_diff, cmap='RdBu', origin='lower',
                             vmin=-np.std(unaligned_diff) * 3, vmax=np.std(unaligned_diff) * 3,
